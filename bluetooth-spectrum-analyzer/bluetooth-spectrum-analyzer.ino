@@ -188,7 +188,7 @@ CRGB redToBlue(float hue)
 {
   CRGB color;
   color.r = std::max((float)255 * (1 - 2 * hue), (float)0);
-  color.g = std::max(std::min(hue * 2 * 255, (1 - hue) * 2 * 255), (float)0);
+  color.g = std::max(min(hue * 2 * 255, (1 - hue) * 2 * 255), (float)0);
   color.b = std::max((float)255 * (hue * 2 - 1), (float)0);
   return color;
 }
@@ -420,7 +420,7 @@ void startAudio()
 
 bool readBuffer()
 {
-  int newSamples = std::min(SAMPLES, a2dp_sink.i2s_config.sample_rate / frameRate);
+  int newSamples = min((int)SAMPLES, a2dp_sink.i2s_config.sample_rate / frameRate);
   if ((writeIndex - readIndex + BUFFER_LENGTH) % BUFFER_LENGTH < newSamples / 2)   // i only ask for half as many samples to be present
   {
     // delay(1);
@@ -465,7 +465,7 @@ bool readBuffer()
 /* This used the float. I had to switch to int16_t to save 16 kB
 bool readBuffer()
 {
-  int newSamples = std::min(SAMPLES, a2dp_sink.i2s_config.sample_rate / frameRate);
+  int newSamples = min(SAMPLES, a2dp_sink.i2s_config.sample_rate / frameRate);
   if ((writeIndex - readIndex + BUFFER_LENGTH) % BUFFER_LENGTH < newSamples * 2)   // newSamples should be multiplied by four but by multiplying it by 2 i only ask for half as many samples to be present
   {
     // delay(1);
