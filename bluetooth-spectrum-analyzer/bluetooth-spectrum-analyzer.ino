@@ -2,13 +2,13 @@
 
 /*
 TODO
-- 4096 (is it even possible?) IT IS POSSIBLE
-- 128 bands might be possible too at 45 fps
+DONE 4096 (is it even possible?) IT IS POSSIBLE
+DONE 128 bands might be possible too at 45 fps. It's actually possible at 115 fps.
 - Change backgound dynamically
 - Animated backgound
   - Perhaps GIFs
 
-- Get samples based on the time the last loop took + 1 %
+DONE Get samples based on the time the last loop took + 1 %
 - Retain both channels so I can analyze them both separately if I wawnt to.
   I'll do the conversion to 16 bits on core 1 instead of core 0.
   This might cost me some microseconds but probably not much since they are just bitwise operations.
@@ -33,7 +33,7 @@ Joo, tuon suuntainen se tyypillinen värien käyttö näissä hetkellissä huipu
 Punainen jos menee +-0dB yli, oranssi "kriittisen lähellä 0dB", ja jotain muuta sitten muuten.
 Mut tässähän nollataso taitaa olla tuolla ylälaidassa, siis laitteen sisäisenä, ja riippuisi sitten sovelluskohteesta ja toteutuksesta mihin kohtaa se suhteellinen 0dB asettuisi.
 Silloin tän laitteen dynamiikasta osa käytettäisiin tuon ylimääräisen headroomin mittaamiseen, vai kuinka Antti Yliniemi?
-
+  
 Teen myös DC:n poistamisen väärin. Tällä hetkellä miinustan signaalista sen keskiarvon.
 Siitä voi aiheutua että kaksi ekaa palkkia nousee kummittelemaan. Tämä DC:n poisto pitää suunnitella järkevästi ettei se käytä liikaa muistia.
 https://ccrma.stanford.edu/~jos/fp/DC_Blocker_Software_Implementations.html
@@ -60,25 +60,42 @@ https://www.youtube.com/watch?v=iZrWMv02tlA
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+I use these libraries:
+https://github.com/hpwit/I2SClocklessLedDriver                // I use a heavily modified version of this library. Will be putting a pull request on his github repo after I've done more testing.
+https://github.com/fakufaku/esp32-fft                         // This is the fastest FFT library I could find. Analyzing 4096 samples takes 5 milliseconds.
+https://github.com/pschatzmann/ESP32-A2DP
+*/
 
-#define FASTLED_ESP32_I2S true
-// #define I2S_DEVICE 0
-
-// #include "WiFi.h"
-#define FASTLED_RMT_MEM_BLOCKS 2      // setting this to 1 gives me 8 parallel rmt outputs but will cause glitching
-// #define FASTLED_ESP32_I2S true
-// #define I2S_DEVICE 1
-#include "FastLED.h"
-FASTLED_USING_NAMESPACE
 #include "BluetoothA2DPSink.h"
 #include "FFT.h"
-// #include "arduinoFFT.h"
-// #include "I2SClocklessLedDriver.h"
-// I2SClocklessLedDriver driver;
+
+struct CRGB {
+  union {
+    struct {
+            union {
+                uint8_t r;
+                uint8_t red;
+            };
+            union {
+                uint8_t g;
+                uint8_t green;
+            };
+            union {
+                uint8_t b;
+                uint8_t blue;
+            };
+        };
+    uint8_t raw[3];
+  };
+};
 
 #include "constants.h"
 
-char BTname[] = "alsonot4096";
+#include "I2SClocklessLedDriver.h"
+I2SClocklessLedDriver driver;
+
+char BTname[] = "4096";
 BluetoothA2DPSink a2dp_sink;
 // TaskHandle_t task1, task2, task3;
 
@@ -86,10 +103,15 @@ BluetoothA2DPSink a2dp_sink;
 // more than 2048 and we run out of ram. less than 512 and we run out of time to draw it on the led panel
 // 512 => 86 fps, 1024 => 43 fps, 2048 => 21 fps
 #define SAMPLES 4096
+#define NUM_PANELS_X 4
+#define NUM_PANELS_Y 1
+#define WAIT
 int newSamples = 650;
-int frameRate = 70;
+int frameRate = 115;           // here for historical reasons. Will be depricated soon.
+#define SECONDS_BETWEEN_DEBUG 15
+int framesBetweenDebug = SECONDS_BETWEEN_DEBUG * frameRate;
+// #define USE_DOUBLE_BUFFERING
 #define BANDS 64
-// const float dynamicRange = (float)DYNAMIC_RANGE / (float)5;    // because we don't do sqrt() our logarithms are twice as large. That is why we divide by 10 and miltiply by 2
 const float dynamicRange = 5.0;    // in bels, not decibels. bel is ten decibels. it's metric. bel is the base unit. long live the metric.
 // #define PRINT_PLOT
 #define DEBUG false
@@ -101,7 +123,8 @@ const float dynamicRange = 5.0;    // in bels, not decibels. bel is ten decibels
 #define PRINT_FFT_TIME
 #define PRINT_ALL_TIME
 #define PRINT_FASTLED_TIME
-#define PRINT_RAM
+#define PRINT_MAPLEDS_TIME
+#define PRINT_RAM                   // This uses some resources that block the isr and take a long time
 // #define PRINT_INDEXES
 // #define TEST_FULL_BUFFER
 #define PRINT_SAMPLE_RATE
@@ -109,80 +132,45 @@ const float dynamicRange = 5.0;    // in bels, not decibels. bel is ten decibels
 #define PRINT_BUFFER_FULL
 
 
-// int16_t binIntervals[65] = {};
 float bands[64] = {};
 #ifdef PRINT_PEAKS
 float peakBands[64] = {};
 #endif
-// Hann, Blackman or Flat top is best for separating distant frequencies. Others suck at that and will make the spectrum more flat.
-// Hann has the smallest initial spread, Blackman comes after that and Flat top has the widest spread
-// I will probably go with Hann which is just a cosine that has been lifted above zero
 
-// This is old information. Kaiser has the best reduction of side lobes and somewhat narrow main lobe. The other windows don't even hold a candle.
+// Kaiser windowing has the best reduction of side lobes and somewhat narrow main lobe. The other windows don't even hold a candle.
 
 int maxCurrent = 2500;
 int maxBrightness = 32;
 
-#define BUFFER_LENGTH 4092   // 3000 is also just fine. maybe 4096 has too much extra space
-// uint8_t bufferRing[BUFFER_LENGTH] = {};
+#define BUFFER_LENGTH 2048   // 2048 is also just fine. maybe 4096 has too much extra space
 IRAM_ATTR int32_t bufferRing[BUFFER_LENGTH] = {};
-// int16_t bufferRing[BUFFER_LENGTH] = {};
 volatile int writeIndex = 0;   // writeIndex will stay 4 behind readIndex. it can't go past
 volatile int readIndex = 0;    // readIndex can be equal to writeIndex but cannot advance
-volatile int bufferFull = 0;
+volatile int bufferFull = 0;  
 volatile int lesserSamples = 0;
 
 float inputReal[SAMPLES] = {};
 float output[SAMPLES] = {};
-// float windowingArray[SAMPLES] = {};
-// float realRing[SAMPLES] = {};
 
 IRAM_ATTR int32_t realRing[SAMPLES] = {};
-// int32_t realRing[SAMPLES] = {};
 
 int realRingIndex = 0;
+const int panelSize = 256;
 
-const int numLeds = 2048;
+#ifdef USE_DOUBLE_BUFFERING
+const int numLeds = panelSize * NUM_PANELS_X * NUM_PANELS_Y * 2;
+#else
+const int numLeds = panelSize * NUM_PANELS_X * NUM_PANELS_Y;
+#endif
+
 // uint8_t *leds = NULL;
-CRGB leds[numLeds];
-// CRGB ledsTemp[numLeds];         // remove this later
-// CRGB templateLeds[numLeds];
-// uint16_t ledMap[numLeds] = {};
-volatile unsigned int beebBoob = 178;    // this is how I keep track of how many frames have been shown
-
+CRGB *leds;
 
 fft_config_t *fftReal = fft_init(SAMPLES, FFT_REAL, FFT_FORWARD, inputReal, output);
 
+uint32_t loopMicros;
+uint32_t loopCycles;
 
-/*
-void printLedMap()
-{
-  Serial.println();
-  Serial.print("const uint16_t templateLeds[] PROGMEM = {");
-  for (int i = 0; i < numLeds; i++)
-  {
-    if (i % 20 == 0) Serial.println();
-    Serial.print(ledMap[i]);
-    Serial.print(", ");
-  }
-  Serial.println("};");
-}
-
-void generateLedMap()
-{
-  for  (int panel = 0; panel < BANDS / 16; panel++)
-  {
-    for  (int i = 0; i < 16; i++)
-    {
-      for (int j = 0; j < 16; j++)
-      {
-        if (i % 2 != 0) ledMap[i * 16 + j + panel * 256] = 16 * (16 - 1 - i) + j + panel * 256;
-        else ledMap[i * 16 + j + panel * 256] = 16 * (16 - 1 - i) + 15 - j + panel * 256;
-      }
-    }
-  }
-  printLedMap();
-}
 
 CRGB redToBlue(float hue)
 {
@@ -193,113 +181,23 @@ CRGB redToBlue(float hue)
   return color;
 }
 
-void printTemplateLeds()
-{
-  Serial.println();
-  Serial.print("const CRGB templateLeds[] PROGMEM = {");
-  for (int i = 0; i < numLeds; i++)
-  {
-    if (i % 10 == 0) Serial.println();
-    Serial.print("{");
-    Serial.print(templateLeds[i][0]);
-    Serial.print(", ");
-    Serial.print(templateLeds[i][1]);
-    Serial.print(", ");
-    Serial.print(templateLeds[i][2]);
-    Serial.print("}");
-    Serial.print(", ");
-  }
-  Serial.println("};");
-}
-
-void generateTemplateHSV()
-{
-  for  (int i = 0; i < BANDS; i++)
-  {
-    for (int j = 0; j < 16; j++)
-    {
-      // Serial.println(String("CHSV ") + (i * 160 / 31) + " " + (255 - 128 * j / 15) + " 16");
-      // CRGB color = CHSV(i * 160 / 31, 255, 255);
-      // CRGB color = CHSV(powf(i, 1.5) / powf(31, 1.5) * 160.0, 255, 255);
-      CRGB color = redToBlue(powf((float)i / (BANDS - 1), 1.6));
-      templateLeds[i * 16 + j].r = color.r / 11;
-      templateLeds[i * 16 + j].g = color.g / 9;
-      templateLeds[i * 16 + j].b = color.b / 17;
-    }
-  }
-  printTemplateLeds();
-}
-*/
-
 void mapLeds()
 {
   for (int i = 0; i < BANDS; i++)
   {
     for (int j = 0; j < 16; j++)
     {
-      // if ((bands[i] * 16 - j) > 0) leds[(ledMap[i * 16 + j]) * 3 + 1] = 1;
-      // else leds[(ledMap[i * 16 + j]) * 3 + 1] = 0;
       if ((bands[i] * 16 - j) >= 0) leds[ledMap[i * 16 + j]] = templateLeds[i * 16 + j];
       else if ((bands[i] * 16 - j) > -1)
       {
-        leds[ledMap[i * 16 + j]][0] = ((float)templateLeds[i * 16 + j][0] + 1.0) * (bands[i] * 16.0 - j + 1.0);   // I add one to the color so that if it's small it doesn't disappear first. now if the color is one, it will disappear in the middle.
-        leds[ledMap[i * 16 + j]][1] = ((float)templateLeds[i * 16 + j][1] + 1.0) * (bands[i] * 16.0 - j + 1.0);
-        leds[ledMap[i * 16 + j]][2] = ((float)templateLeds[i * 16 + j][2] + 1.0) * (bands[i] * 16.0 - j + 1.0);
+        leds[ledMap[i * 16 + j]].r = ((float)templateLeds[i * 16 + j].r + 1.0) * (bands[i] * 16.0 - j + 1.0);   // I add one to the color so that if it's small it doesn't disappear first. now if the color is one, it will disappear in the middle.
+        leds[ledMap[i * 16 + j]].g = ((float)templateLeds[i * 16 + j].g + 1.0) * (bands[i] * 16.0 - j + 1.0);
+        leds[ledMap[i * 16 + j]].b = ((float)templateLeds[i * 16 + j].b + 1.0) * (bands[i] * 16.0 - j + 1.0);
       }
-      else leds[ledMap[i * 16 + j]] = CRGB::Black;
+      else leds[ledMap[i * 16 + j]] = {0, 0, 0};
     }
   }
 }
-
-/*
-void generateBinIntervals()
-{
-  for (int i = 0; i < BANDS + 1; i++)
-  {
-    if (SAMPLES == 4096 && BANDS == 64) binIntervals[i] = bins_4096_64[i];
-    if (SAMPLES == 4096 && BANDS == 48) binIntervals[i] = bins_4096_48[i];
-    if (SAMPLES == 4096 && BANDS == 32) binIntervals[i] = bins_4096_32[i];
-    if (SAMPLES == 4096 && BANDS == 16) binIntervals[i] = bins_4096_16[i];
-    
-    if (SAMPLES == 2048 && BANDS == 64) binIntervals[i] = bins_2048_64[i];
-    if (SAMPLES == 2048 && BANDS == 48) binIntervals[i] = bins_2048_48[i];
-    if (SAMPLES == 2048 && BANDS == 32) binIntervals[i] = bins_2048_32[i];
-    if (SAMPLES == 2048 && BANDS == 16) binIntervals[i] = bins_2048_16[i];
-  }
-  if (binIntervals[BANDS] > SAMPLES / 2) binIntervals[BANDS] = SAMPLES / 2;
-  Serial.print("Last binInterval = ");
-  Serial.println(binIntervals[BANDS]);
-}
-*/
-
-/*
-void createWindowing(float a, float multiplier)
-{
-  float temp = 0;
-  Serial.print("const float windowingArray[] PROGMEM = {");
-  for (int i = 0; i < SAMPLES; i++)
-  {
-    temp = ((float)a - (1.0 - a) * (cos(TWO_PI * (float)i / (float)(SAMPLES - 1)))) * multiplier;    // a = 0.5 (Hann), a = 0.54 (Hamming)
-    if (a == -1) temp = (0.44959 - (0.49364 * (cos(TWO_PI * (float)i / (float)(SAMPLES - 1)))) + (0.05677 * (cos(2 * TWO_PI * (float)i / (float)(SAMPLES - 1))))) * multiplier;    // Blackman
-    if (a == -2) temp = (0.42323 - (0.49755 * (cos(TWO_PI * (float)i / (float)(SAMPLES - 1)))) + (0.07922 * (cos(2 * TWO_PI * (float)i / (float)(SAMPLES - 1))))) * multiplier;    // Blackman
-    if (a == -3) temp = 1 * multiplier;     // -3 equals no windowing
-    if (a == -4) temp = (0.21557895
-        - 0.416631580 * cos(1 * TWO_PI * (float)i / (float)(SAMPLES - 1))
-        + 0.277263158 * cos(2 * TWO_PI * (float)i / (float)(SAMPLES - 1))
-        - 0.083578947 * cos(3 * TWO_PI * (float)i / (float)(SAMPLES - 1))
-        + 0.006947368 * cos(4 * TWO_PI * (float)i / (float)(SAMPLES - 1))) * multiplier;    // flat top
-    if (a == -5) temp = (0.355768
-        - 0.487396 * cos(1 * TWO_PI * (float)i / (float)(SAMPLES - 1))
-        + 0.144232 * cos(2 * TWO_PI * (float)i / (float)(SAMPLES - 1))
-        - 0.012604 * cos(3 * TWO_PI * (float)i / (float)(SAMPLES - 1))
-        + 0.0 * cos(4 * TWO_PI * (float)i / (float)(SAMPLES - 1))) * multiplier;    // nuttal
-    if (i % 10 == 0) Serial.println();
-    Serial.print(temp, 10);
-    Serial.print(", ");
-  }
-  Serial.println("};");
-}
-*/
 
 void doWindowing()
 {
@@ -316,12 +214,9 @@ void doWindowing()
   }
 }
 
-
 void audio_data_callback(const uint8_t *data, uint32_t byteLen)
 {
   int actualLen = byteLen / 4;
-  // int free = (mHead - mTail + mSize - 1)%mSize;
-  // if ((readIndex - writeIndex + BUFFER_LENGTH - 1) % BUFFER_LENGTH <= BUFFER_LENGTH / 4)
   if ((readIndex - writeIndex + BUFFER_LENGTH - 1) % BUFFER_LENGTH <= actualLen)
   {
     bufferFull++;
@@ -335,33 +230,7 @@ void audio_data_callback(const uint8_t *data, uint32_t byteLen)
     }
   }
   writeIndex = (writeIndex + actualLen) % BUFFER_LENGTH;
-  /*
-  else if (writeIndex + actualLen <= BUFFER_LENGTH)
-  {
-    // memcpy(&bufferRing[writeIndex], &data[0], len);
-    for (int i = i; i < actualLen; i++)
-    {
-      // bufferRing[writeIndex + i] = (int16_t)(((int)*(int16_t*)&(data[readIndex * 4]) + (int)*(int16_t*)&(data[readIndex * 4 + 2])));
-      bufferRing[writeIndex + i] = *(int16_t*)&(data[readIndex * 4]) / 2 + *(int16_t*)&(data[readIndex * 4 + 2]);
-    }
-    writeIndex = (writeIndex + actualLen) % (BUFFER_LENGTH);
-  }
-  else
-  {
-    int written = BUFFER_LENGTH - writeIndex;
-    for (int i = i; i < written; i++)
-    {
-      // bufferRing[writeIndex + i] = (int16_t)(((int)*(int16_t*)&(data[readIndex * 4]) + (int)*(int16_t*)&(data[readIndex * 4 + 2])));
-      bufferRing[writeIndex + i] = *(int16_t*)&(data[readIndex * 4]) / 2 + *(int16_t*)&(data[readIndex * 4 + 2]);
-    }
-    for (int i = i; i < actualLen - written; i++)
-    {
-      bufferRing[i] = *(int16_t*)&(data[(written + i) * 4]) / 2 + *(int16_t*)&(data[(written + i) * 4 + 2]);
-    }
-    // memcpy(&bufferRing[0], &data[written], len - written);
-    writeIndex = (writeIndex + actualLen) % (BUFFER_LENGTH);
-  }
-  */
+  
   #ifdef PRINT_INDEXES
   Serial.print("Got ");
   Serial.print(actualLen);
@@ -370,38 +239,11 @@ void audio_data_callback(const uint8_t *data, uint32_t byteLen)
   #endif
 }
 
-/* This used the float. I had to switch to int16_t to save 16 kB
-void audio_data_callback(const uint8_t *data, uint32_t len)
-{
-  // int free = (mHead - mTail + mSize - 1)%mSize;
-  // if ((readIndex - writeIndex + BUFFER_LENGTH - 1) % BUFFER_LENGTH <= BUFFER_LENGTH / 4)
-  if ((readIndex - writeIndex + BUFFER_LENGTH - 1) % BUFFER_LENGTH <= len)
-  {
-    bufferFull++;
-  }
-  else if (writeIndex + len <= BUFFER_LENGTH)
-  {
-    memcpy(&bufferRing[writeIndex], &data[0], len);
-    writeIndex = (writeIndex + len) % BUFFER_LENGTH;
-  }
-  else
-  {
-    int written = BUFFER_LENGTH - writeIndex;
-    memcpy(&bufferRing[writeIndex], &data[0], written);
-    memcpy(&bufferRing[0], &data[written], len - written);
-    writeIndex = (writeIndex + len) % BUFFER_LENGTH;
-  }
-  #ifdef PRINT_INDEXES
-  Serial.println(String("Got ") + len + " data, writeIndex = " + writeIndex);
-  #endif
-}
-*/
-
 void startAudio()
 {
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t) (I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = 16000, // updated automatically by A2DP
+    .sample_rate = 44100, // updated automatically by A2DP
     .bits_per_sample = (i2s_bits_per_sample_t)16,
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = (i2s_comm_format_t) (I2S_COMM_FORMAT_STAND_I2S),
@@ -414,13 +256,21 @@ void startAudio()
   a2dp_sink.set_i2s_config(i2s_config);
   a2dp_sink.set_i2s_port(I2S_NUM_1);
   a2dp_sink.set_stream_reader(audio_data_callback);
+  /*
+  i2s_pin_config_t my_pin_config = {
+      .bck_io_num = 15,
+      .ws_io_num = 2,
+      .data_out_num = 4,
+      .data_in_num = I2S_PIN_NO_CHANGE };
+  a2dp_sink.set_pin_config(my_pin_config);
+  */
   a2dp_sink.start(BTname);
   Serial.println(String("Started Bluetooth audio receiver with the name ") + BTname);
 }
 
 bool readBuffer()
 {
-  int newSamples = min((int)SAMPLES, a2dp_sink.i2s_config.sample_rate / frameRate);
+  int newSamples = min(min(SAMPLES, a2dp_sink.sample_rate() * (int)loopMicros / 990000), BUFFER_LENGTH);
   if ((writeIndex - readIndex + BUFFER_LENGTH) % BUFFER_LENGTH < newSamples / 2)   // i only ask for half as many samples to be present
   {
     // delay(1);
@@ -462,48 +312,11 @@ bool readBuffer()
   return true;
 }
 
-/* This used the float. I had to switch to int16_t to save 16 kB
-bool readBuffer()
-{
-  int newSamples = min(SAMPLES, a2dp_sink.i2s_config.sample_rate / frameRate);
-  if ((writeIndex - readIndex + BUFFER_LENGTH) % BUFFER_LENGTH < newSamples * 2)   // newSamples should be multiplied by four but by multiplying it by 2 i only ask for half as many samples to be present
-  {
-    // delay(1);
-    return false;
-  }
-  if ((writeIndex - readIndex + BUFFER_LENGTH) % BUFFER_LENGTH < newSamples * 4)
-  {
-    // delay(1);
-    newSamples = ((writeIndex - readIndex + BUFFER_LENGTH) % BUFFER_LENGTH) / 4;
-    lesserSamples = newSamples;
-  }
-  
-  {
-    for (int i = 0; i < newSamples; i++)
-    {
-      realRing[realRingIndex] = (float)*(int16_t*)&(bufferRing[readIndex]) + (float)*(int16_t*)&(bufferRing[readIndex + 2]);
-      realRingIndex = (realRingIndex + 1) % SAMPLES;
-      readIndex = (readIndex + 4) % BUFFER_LENGTH;
-    }
-    #ifdef PRINT_INDEXES
-    Serial.println(String("readIndex = ") + readIndex + ", realRingIndex = " + realRingIndex);
-    #endif
-  }
-
-  memcpy(&inputReal[0], &realRing[realRingIndex], (SAMPLES - realRingIndex) * sizeof(float));
-  memcpy(&inputReal[SAMPLES - realRingIndex], &realRing[0], (realRingIndex) * sizeof(float));
-  return true;
-}
-*/
-
 void powerOfTwo()
 {
   for (int index = 0; index < SAMPLES / 2; index++)
   {
-    // Serial.println(String(index) + ": " + output[index * 2]);
     output[index] = output[index * 2] * output[index * 2] + output[index * 2 + 1] * output[index * 2 + 1];
-    // output[index] = output[index * 2] * output[index * 2]; // + output[index * 2 + 1] * output[index * 2 + 1];
-    // outputPowTwo[index] = output[index * 2];
   }
 }
 
@@ -520,7 +333,9 @@ void powTwoBands()
   {
     bands[i] = 0;
     #if SAMPLES == 4096
+    #if BANDS == 64
     for (int j = bins_4096_64[i]; j < bins_4096_64[i + 1]; j++)
+    #endif
     #endif 
     #if SAMPLES == 2048
     for (int j = bins_2048_64[i]; j < bins_2048_64[i + 1]; j++)
@@ -592,8 +407,6 @@ void setup()
   Serial.begin(115200);
   #endif
   Serial.println("Just booted up");
-  // Serial.println(String(testSqrt(1000) * 1000000) + " is the maximum error of sqrtApprox");
-  
   Serial.print("ESP.getFreeHeap() = ");
   Serial.println(ESP.getFreeHeap());
   Serial.print("heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) = ");
@@ -601,118 +414,117 @@ void setup()
   Serial.print("heap_caps_get_largest_free_block(MALLOC_CAP_32BIT) = ");
   Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_32BIT));
   delay(100);
-
-  // with 0.543478261 it's Hamming windowing. with 0.5 it's Hann windowing
-  // we also get free scaling because we can scale the windowing array in advance
-  // createWindowing(25.0/46.0, 1.0/256.0);  // 1.0/32.0 is the lowest sane minimum   // doesn't need to be a power of two. just a habit
-  // createWindowing(-1, 1.0/256.0);  // a = 1 creates Blackman window -61 dB
-  // createWindowing(-4, 1.0/256.0);  // a = -4 creates flat top window -67 dB
-  // createWindowing(-2, 1.0/256.0);  // a = -1 creates no windowing
-  // Reducing side lobes is quite a problem since in the last bands I add like a hundred of them together. That exarbates the problem by 20 dB. That's not neglible.
   
-  // createWindowing(-2, 1.0/256.0);  // a = 0.5 Hann windowing <= this one is my current preference because the side lobes very far away will be quite reduced
-  // delay(1000);
-  // generateBinIntervals();
+  leds = (CRGB *)calloc(numLeds * 3, sizeof(uint8_t));
   
-  // generateTemplateHSV();
-  
-  // Serial.println("1");
-  // leds = (uint8_t *)malloc(sizeof(uint8_t) * numLeds * 3);
-  for (int i = 0; i < sizeof(uint8_t) * numLeds * 3; i++)
-  {
-    leds[i] = 0;
-  }
-  // Serial.println("2");
-  
-  // generateLedMap();
-  
-  // Serial.println("3");
-  // driver.initled((uint8_t*)leds, pins, 2, 256, ORDER_GRB);
-  FastLED.addLeds<NEOPIXEL, 33>(leds, 0*256, 256);
-  #if BANDS > 16
-  FastLED.addLeds<NEOPIXEL, 32>(leds, 1*256, 256);
-  #if BANDS > 32
-  FastLED.addLeds<NEOPIXEL, 12>(leds, 2*256, 256);
-  #if BANDS > 48
-  FastLED.addLeds<NEOPIXEL, 14>(leds, 3*256, 256);
-  /*
-  FastLED.addLeds<NEOPIXEL, 16>(leds, 3*256, 256);
-  FastLED.addLeds<NEOPIXEL, 17>(leds, 3*256, 256);
-  FastLED.addLeds<NEOPIXEL, 18>(leds, 3*256, 256);
-  FastLED.addLeds<NEOPIXEL, 19>(leds, 3*256, 256);
-  */
+  // int pins[] = {32, 33, 25, 26, 27, 12, 13, 14, 15, 16, 17, 5, 18, 19, 21, 22, 23, 4, 0, 2, 1, 3};
+  int pins[] = {33, 32, 12, 14, 27, 0, 13, 0, 15, 16, 17, 5, 18, 19, 21, 22, 23, 4, 0, 2, 1, 3};              // esp32 dev kit v1
+  #ifndef WAIT
+  driver.__displayMode = NO_WAIT;
   #endif
-  #endif
-  #endif
-  FastLED.setMaxPowerInVoltsAndMilliamps(5, maxCurrent);
-
+  driver.initled((uint8_t*)leds, pins, 7, panelSize, ORDER_GRB);
+  
   startAudio();
-
+  Serial.print("ESP.getFreeHeap() = ");
+  Serial.println(ESP.getFreeHeap());
+  Serial.print("heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) = ");
+  Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  Serial.print("heap_caps_get_largest_free_block(MALLOC_CAP_32BIT) = ");
+  Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_32BIT));
+  delay(100);
 }
 
 void loop()
 {
   static unsigned int beebBoob = 178;
+  static uint32_t previousMicros = 0;
+  static uint32_t previousCycles = 0;
+  uint32_t newMicros = micros();;
+  uint32_t newCycles = xthal_get_ccount();
+  loopMicros = newMicros - previousMicros;
+  loopCycles = newCycles - previousCycles;
+  previousMicros = newMicros;
+  previousCycles = newCycles;
   beebBoob++;
-  for (;;)
+  while (true)
   {
     if (readBuffer()) break;
-    else delayMicroseconds(100);
+    else
+    {
+      vTaskDelay(1);
+      previousMicros = micros();
+      previousCycles = xthal_get_ccount();
+    }
   }
 
-  // debug("buffer read");
+
   #ifdef PRINT_FFT_TIME
-  unsigned int fftMicros = micros();
+  uint32_t fftMicros = micros();
+  uint32_t fftCycles = xthal_get_ccount();
   #endif
   
   doWindowing();
-  // debug("windowing done");
   fft_execute(fftReal);
-  #ifdef PRINT_PLOT
-  plot();
-  #endif
-  // plotInput();
-  // debug("fftReal executed");
   powerOfTwo();   // if we end up doing log() of the output anyways there is no need to do costly sqrt() because it's the same as dividing log() by 2
   // sqrtBins();     // we don't actually need this since we are dealing with the power of the signal and not the amplitude
-  // Serial.println(String("sqrt took ") + (micros() - sqrtMicros) + " μs");
   zeroSmallBins();  // we do this because there are plenty of of reflections in the surrounding bins
-  // debug("powerOfTwo");
-  // I'll have to get rid of powTwoBands and actually do sqrt() on every bin since I'm goin to add them all up
   powTwoBands();
   logBands();
   normalizeBands();
-  // superNormalizeBands();      // maybe we'll do something like this later. now i need full info for debugging and testing
-
-  #ifdef PRINT_BANDS
-  printBands();
-  #endif
-  // printOutput();
-  // logFFT();     // logarithm is super costly. that's why we only do it once per band instead of once per bin in the logBands()
-  // debug("logFFT");
-  // if (PLOTTER) plot();
-  // Serial.println("5");
-  mapLeds();
-  // Serial.println("6");
-  // driver.setBrightness(limitCurrent(leds, numLeds, maxCurrent, maxBrightness));
-  // Serial.println("7");
+  
   #ifdef PRINT_FFT_TIME
-  if (beebBoob % 179 == 0)
-  {
-    Serial.print("FFT took ");
-    Serial.print(micros() - fftMicros);
-    Serial.println(" μs");
-  }
+  fftMicros = micros() - fftMicros;
+  fftCycles = xthal_get_ccount() - fftCycles;
   #endif
+  #ifndef WAIT
+  driver.waitUntilDone();
+  #endif
+  
   #ifdef PRINT_RAM
-  int heap_caps_get_largest_free_block_8bit_min = 1000000000;
-  int heap_caps_get_largest_free_block_32bit_min = 1000000000;
+  // I had to move these commands here because they bothered I2SCloclessLedDriver
+  // They do something that blocks the interruots or something
+  // I was getting pretty garbled results just because of this
+  // I had to wait until I2SCloclessLedDriver was done drawing the leds
+  static int heap_caps_get_largest_free_block_8bit_min = 1000000000;
+  static int heap_caps_get_largest_free_block_32bit_min = 1000000000;
   int newValue = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   if (newValue < heap_caps_get_largest_free_block_8bit_min) heap_caps_get_largest_free_block_8bit_min = newValue;
   newValue = heap_caps_get_largest_free_block(MALLOC_CAP_32BIT);
   if (newValue < heap_caps_get_largest_free_block_32bit_min) heap_caps_get_largest_free_block_32bit_min = newValue;
-  if (beebBoob % 179 == 0)
+  #endif
+  
+  uint32_t mapLedsMicros = micros();
+  uint32_t mapLedsCycles = xthal_get_ccount();
+  
+  mapLeds();
+
+  mapLedsMicros = micros() - mapLedsMicros;
+  mapLedsCycles = xthal_get_ccount() - mapLedsCycles;
+  
+  uint32_t showPixelsMicros = micros();
+  uint32_t showPixelsCycles = xthal_get_ccount();
+  
+  driver.showPixels((uint8_t *)leds);
+
+  showPixelsMicros = micros() - showPixelsMicros;
+  showPixelsCycles = xthal_get_ccount() - showPixelsCycles;
+  
+  #ifdef PRINT_PLOT
+  plot();
+  #endif
+  #ifdef PRINT_BANDS
+  printBands();
+  #endif
+  if (beebBoob % framesBetweenDebug == 0)
   {
+  #ifdef PRINT_FFT_TIME
+    Serial.print("FFT took ");
+    Serial.print(fftMicros);
+    Serial.print(" ");
+    Serial.print((fftCycles) / 240);
+    Serial.println(" μs");
+  #endif
+  #ifdef PRINT_RAM
     Serial.print("ESP.getFreeHeap() = ");
     Serial.println(ESP.getFreeHeap());
     Serial.print("heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) = ");
@@ -721,43 +533,33 @@ void loop()
     Serial.println(heap_caps_get_largest_free_block_32bit_min);
     heap_caps_get_largest_free_block_8bit_min = 1000000000;
     heap_caps_get_largest_free_block_32bit_min = 1000000000;
-  }
   #endif
-  // printLeds();
-  // driver.showPixels((uint8_t*)leds);
-  unsigned int fastledMicros = micros();
-  FastLED.show();
   #ifdef PRINT_FASTLED_TIME
-  if (beebBoob % 179 == 0)
-  {
-    Serial.print("FastLED took ");
-    Serial.print(micros() - fastledMicros);
-    Serial.println(" μs");
-  }
+    Serial.print("driver.showPixels() took ");
+    Serial.print(showPixelsMicros);
+    Serial.print(" ");
+    Serial.print((showPixelsCycles) / 240);
+    Serial.println(" μs ");
+  #endif
+  #ifdef PRINT_MAPLEDS_TIME
+    Serial.print("MapLeds took ");
+    Serial.print(mapLedsMicros);
+    Serial.print(" ");
+    Serial.print((mapLedsCycles) / 240);
+    Serial.println(" μs ");
   #endif
   #ifdef PRINT_SAMPLE_RATE
-  if (beebBoob % 179 == 0)
-  {
-    Serial.print("a2dp_sink.i2s_config.sample_rate = ");
-    Serial.println(a2dp_sink.i2s_config.sample_rate);
-  }
+    Serial.print("a2dp_sink.sample_rate() = ");
+    Serial.println(a2dp_sink.sample_rate());
   #endif
   #ifdef PRINT_ALL_TIME
-  static unsigned int previousMicros;
-  unsigned int newMicros = micros();
-  if (beebBoob % 179 == 0)
-  {
     Serial.print("everything took ");
-    Serial.print(newMicros - previousMicros);
-    Serial.print(" μs, FFT and FastLED took ");
-    Serial.print(newMicros - fftMicros);
+    Serial.print(loopMicros);
+    Serial.print(" ");
+    Serial.print((loopCycles) / 240);
     Serial.println(" μs");
-  }
   #endif
-  // Serial.println(String("readIndex = ") + readIndex);
   #ifdef PRINT_PEAKS
-  if (beebBoob % 179 == 0)
-  {
     Serial.print("Peak bands: ");
     for (int i = 0; i < BANDS; i++)
     {
@@ -765,34 +567,23 @@ void loop()
       Serial.print(", ");
     }
     Serial.println();
-  }
   #endif
   #ifdef PRINT_LESSER_SAMPLES
-  if ((beebBoob % 179 == 0) && (lesserSamples > 0))
-  {
+  if ((beebBoob % framesBetweenDebug == 0) && (lesserSamples > 0))
     Serial.print("lesserSamples = ");
     Serial.println(lesserSamples);
     lesserSamples = 0;
-  }
   #endif
   #ifdef PRINT_BUFFER_FULL
-  if ((beebBoob % 7727 == 0) && (bufferFull > 0))
-  {
-    Serial.print("BUFFER FULL. DISCARDING DATA. BUFFER FULL. DISCARDING DATA. BUFFER FULL. bufferFull = ");
-    Serial.println(bufferFull);
-    /*
-    newSamples += 10;
-    Serial.print("newSamples = ");
-    Serial.println(newSamples);
-    */
-    bufferFull = 0;
+    if (bufferFull > 0)
+    {
+      Serial.print("BUFFER FULL. DISCARDING DATA. BUFFER FULL. DISCARDING DATA. BUFFER FULL. bufferFull = ");
+      Serial.println(bufferFull);
+      bufferFull = 0;
+    }
+  #endif
   }
-  #endif
-  #ifdef PRINT_ALL_TIME
-  previousMicros = newMicros;
-  #endif
-  // delayMicroseconds(100);
   #ifdef TEST_FULL_BUFFER
-  delay(100);
+  delay(150);
   #endif
 }
