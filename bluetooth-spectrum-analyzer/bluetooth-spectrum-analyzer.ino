@@ -2,13 +2,13 @@
 
 /*
 TODO
-- 4096 (is it even possible?) IT IS POSSIBLE
-- 128 bands might be possible too at 45 fps
+DONE 4096 (is it even possible?) IT IS POSSIBLE
+DONE 128 bands might be possible too at 45 fps. It's actually possible at 115 fps.
 - Change backgound dynamically
 - Animated backgound
   - Perhaps GIFs
 
-- Get samples based on the time the last loop took + 1 %
+DONE Get samples based on the time the last loop took + 1 %
 - Retain both channels so I can analyze them both separately if I wawnt to.
   I'll do the conversion to 16 bits on core 1 instead of core 0.
   This might cost me some microseconds but probably not much since they are just bitwise operations.
@@ -33,7 +33,7 @@ Joo, tuon suuntainen se tyypillinen värien käyttö näissä hetkellissä huipu
 Punainen jos menee +-0dB yli, oranssi "kriittisen lähellä 0dB", ja jotain muuta sitten muuten.
 Mut tässähän nollataso taitaa olla tuolla ylälaidassa, siis laitteen sisäisenä, ja riippuisi sitten sovelluskohteesta ja toteutuksesta mihin kohtaa se suhteellinen 0dB asettuisi.
 Silloin tän laitteen dynamiikasta osa käytettäisiin tuon ylimääräisen headroomin mittaamiseen, vai kuinka Antti Yliniemi?
-
+  
 Teen myös DC:n poistamisen väärin. Tällä hetkellä miinustan signaalista sen keskiarvon.
 Siitä voi aiheutua että kaksi ekaa palkkia nousee kummittelemaan. Tämä DC:n poisto pitää suunnitella järkevästi ettei se käytä liikaa muistia.
 https://ccrma.stanford.edu/~jos/fp/DC_Blocker_Software_Implementations.html
@@ -60,248 +60,298 @@ https://www.youtube.com/watch?v=iZrWMv02tlA
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+/*
+I use these libraries:
+https://github.com/hpwit/I2SClocklessLedDriver                // I use a heavily modified version of this library. Will be putting a pull request on his github repo after I've done more testing.
+https://github.com/yliniemi/I2SClocklessLedDriver/tree/dev    // This is my current heavily modified version. Perhaps the changes end up in the hpwit's version some day
+https://github.com/fakufaku/esp32-fft                         // This is the fastest FFT library I could find. Analyzing 4096 samples takes 5 milliseconds.
+https://github.com/pschatzmann/ESP32-A2DP
+*/
 
-#define FASTLED_ESP32_I2S true
-// #define I2S_DEVICE 0
-
-// #include "WiFi.h"
-#define FASTLED_RMT_MEM_BLOCKS 2      // setting this to 1 gives me 8 parallel rmt outputs but will cause glitching
-// #define FASTLED_ESP32_I2S true
-// #define I2S_DEVICE 1
-#include "FastLED.h"
-FASTLED_USING_NAMESPACE
 #include "BluetoothA2DPSink.h"
 #include "FFT.h"
-// #include "arduinoFFT.h"
-// #include "I2SClocklessLedDriver.h"
-// I2SClocklessLedDriver driver;
+
+struct CRGB {
+  union {
+    struct {
+            union {
+                uint8_t r;
+                uint8_t red;
+            };
+            union {
+                uint8_t g;
+                uint8_t green;
+            };
+            union {
+                uint8_t b;
+                uint8_t blue;
+            };
+        };
+    uint8_t raw[3];
+  };
+};
+
+struct FloatOffset
+{
+  float x;
+  float y;
+};
 
 #include "constants.h"
 
-char BTname[] = "alsonot4096";
-BluetoothA2DPSink a2dp_sink;
+#define TILE_WIDTH 32
+#define TILE_HEIGHT 32
+#define ENABLE_LEDMAP
+#define PANEL_WIDTH 16
+#define PANEL_HEIGHT 16
+#define NUM_PANELS_PER_ROW 7
+#define NUM_PANELS_PER_COLUMN 2
+#define SCREEN_WIDTH PANEL_WIDTH * NUM_PANELS_PER_ROW
+#define SCREEN_HEIGHT PANEL_HEIGHT * NUM_PANELS_PER_COLUMN
+
 // TaskHandle_t task1, task2, task3;
 
 // has to be between 512 - 2048
 // more than 2048 and we run out of ram. less than 512 and we run out of time to draw it on the led panel
 // 512 => 86 fps, 1024 => 43 fps, 2048 => 21 fps
 #define SAMPLES 4096
-int newSamples = 650;
-int frameRate = 70;
-#define BANDS 64
-// const float dynamicRange = (float)DYNAMIC_RANGE / (float)5;    // because we don't do sqrt() our logarithms are twice as large. That is why we divide by 10 and miltiply by 2
+// #define WAIT_UNTIL_DRAWING_DONE
+#define SECONDS_BETWEEN_DEBUG 60
+
+// #define USE_DOUBLE_BUFFERING
+#define BANDS 112
 const float dynamicRange = 5.0;    // in bels, not decibels. bel is ten decibels. it's metric. bel is the base unit. long live the metric.
 // #define PRINT_PLOT
 #define DEBUG false
+// #define DEBUG true
 // #define PRINT_BANDS
 // #define PRINT_CEILING
 #define USE_SERIAL
-#define PRINT_OUTPUT
+// #define PRINT_OUTPUT
 // #define PRINT_PEAKS
 #define PRINT_FFT_TIME
 #define PRINT_ALL_TIME
 #define PRINT_FASTLED_TIME
-#define PRINT_RAM
+#define PRINT_MAPLEDS_TIME
+// #define PRINT_RAM                   // This uses some resources that block the isr and take a long time
 // #define PRINT_INDEXES
 // #define TEST_FULL_BUFFER
 #define PRINT_SAMPLE_RATE
 #define PRINT_LESSER_SAMPLES
 #define PRINT_BUFFER_FULL
 
+// Kaiser windowing has the best reduction of side lobes and somewhat narrow main lobe. The other windows don't even hold a candle.
 
-// int16_t binIntervals[65] = {};
-float bands[64] = {};
-#ifdef PRINT_PEAKS
-float peakBands[64] = {};
-#endif
-// Hann, Blackman or Flat top is best for separating distant frequencies. Others suck at that and will make the spectrum more flat.
-// Hann has the smallest initial spread, Blackman comes after that and Flat top has the widest spread
-// I will probably go with Hann which is just a cosine that has been lifted above zero
+int maxCurrent = 15000;
+// int maxBrightness = 32;
 
-// This is old information. Kaiser has the best reduction of side lobes and somewhat narrow main lobe. The other windows don't even hold a candle.
-
-int maxCurrent = 2500;
-int maxBrightness = 32;
-
-#define BUFFER_LENGTH 4092   // 3000 is also just fine. maybe 4096 has too much extra space
-// uint8_t bufferRing[BUFFER_LENGTH] = {};
+#define BUFFER_LENGTH 1700   // 2048 is also just fine. maybe 4096 has too much extra space
 IRAM_ATTR int32_t bufferRing[BUFFER_LENGTH] = {};
-// int16_t bufferRing[BUFFER_LENGTH] = {};
 volatile int writeIndex = 0;   // writeIndex will stay 4 behind readIndex. it can't go past
 volatile int readIndex = 0;    // readIndex can be equal to writeIndex but cannot advance
-volatile int bufferFull = 0;
+volatile int bufferFull = 0;  
 volatile int lesserSamples = 0;
 
-float inputReal[SAMPLES] = {};
-float output[SAMPLES] = {};
-// float windowingArray[SAMPLES] = {};
-// float realRing[SAMPLES] = {};
-
 IRAM_ATTR int32_t realRing[SAMPLES] = {};
-// int32_t realRing[SAMPLES] = {};
 
 int realRingIndex = 0;
 
-const int numLeds = 2048;
+const int numLeds = NUM_PANELS_PER_ROW * NUM_PANELS_PER_COLUMN * PANEL_WIDTH * PANEL_HEIGHT;
+
 // uint8_t *leds = NULL;
-CRGB leds[numLeds];
-// CRGB ledsTemp[numLeds];         // remove this later
-// CRGB templateLeds[numLeds];
-// uint16_t ledMap[numLeds] = {};
-volatile unsigned int beebBoob = 178;    // this is how I keep track of how many frames have been shown
+// CRGB *leds;
+CRGB* leds;
 
+uint32_t loopMicros;
+uint32_t loopCycles;
 
-fft_config_t *fftReal = fft_init(SAMPLES, FFT_REAL, FFT_FORWARD, inputReal, output);
+#include "I2SClocklessLedDriver.h"
+I2SClocklessLedDriver driver;
 
+char BTname[] = "triumvirate";
+BluetoothA2DPSink a2dp_sink;
 
-/*
-void printLedMap()
+OffsetDisplay offd;
+FloatOffset groundOffset;
+FloatOffset skyOffset;
+
+enum {bluetooth, microphone, artnet} programMode;
+
+static Coordinates IRAM_ATTR mapLed(int hardwareLed)
 {
-  Serial.println();
-  Serial.print("const uint16_t templateLeds[] PROGMEM = {");
-  for (int i = 0; i < numLeds; i++)
+  Coordinates coordinates;
+  // = MOD(FLOOR(A11 / 4), 12)
+  coordinates.x = (hardwareLed / PANEL_HEIGHT) % (PANEL_WIDTH * NUM_PANELS_PER_ROW);
+  // = MOD(MOD(FLOOR(A11 / 4) + 1, 2) * MOD(A11, 4) + MOD(FLOOR(A11 / 4), 2) * MOD(95 - A11, 4) + FLOOR(A11 / 48) * 4, 96)
+  coordinates.y = (hardwareLed / PANEL_HEIGHT) % 2;
+  if (coordinates.y == 0)
   {
-    if (i % 20 == 0) Serial.println();
-    Serial.print(ledMap[i]);
-    Serial.print(", ");
+    coordinates.y = (hardwareLed % PANEL_HEIGHT) + (hardwareLed / (PANEL_WIDTH * PANEL_HEIGHT * NUM_PANELS_PER_ROW)) * PANEL_HEIGHT;
+    // coordinates.y = ((hardwareLed % PANEL_HEIGHT) + (hardwareLed / (PANEL_WIDTH * NUM_PANELS_PER_ROW)) * PANEL_HEIGHT) % (PANEL_WIDTH * NUM_PANELS_PER_ROW * NUM_PANELS_PER_COLUMN);
   }
-  Serial.println("};");
+  else
+  {
+    coordinates.y = ((PANEL_HEIGHT * 12345 - 1 - hardwareLed) % PANEL_HEIGHT) + (hardwareLed / (PANEL_WIDTH * PANEL_HEIGHT * NUM_PANELS_PER_ROW)) * PANEL_HEIGHT;
+    // coordinates.y = (((PANEL_HEIGHT * 12345 - 1 - hardwareLed) % PANEL_HEIGHT) + (hardwareLed / (PANEL_WIDTH * NUM_PANELS_PER_ROW)) * PANEL_HEIGHT) % (PANEL_WIDTH * NUM_PANELS_PER_ROW * NUM_PANELS_PER_COLUMN);
+  }
+  // coordinates.y = (((hardwareLed / 16 + 1) % 2) * (hardwareLed % 16) + ((hardwareLed / 16) % 2) * ((16 * 123 - 1 - hardwareLed) % 16) + (hardwareLed / (16 * 7)) * 16 ) % (16 * 7 * 2);
+  return coordinates;
 }
 
-void generateLedMap()
+float sqrtApprox(float number)
 {
-  for  (int panel = 0; panel < BANDS / 16; panel++)
-  {
-    for  (int i = 0; i < 16; i++)
-    {
-      for (int j = 0; j < 16; j++)
-      {
-        if (i % 2 != 0) ledMap[i * 16 + j + panel * 256] = 16 * (16 - 1 - i) + j + panel * 256;
-        else ledMap[i * 16 + j + panel * 256] = 16 * (16 - 1 - i) + 15 - j + panel * 256;
-      }
-    }
-  }
-  printLedMap();
+  union { float f; uint32_t u; } y = {number};
+  y.u = 0x5F1FFFF9ul - (y.u >> 1);
+  return number * 0.703952253f * y.f * (2.38924456f - number * y.f * y.f);
 }
 
 CRGB redToBlue(float hue)
 {
   CRGB color;
-  color.r = std::max((float)255 * (1 - 2 * hue), (float)0);
-  color.g = std::max(min(hue * 2 * 255, (1 - hue) * 2 * 255), (float)0);
-  color.b = std::max((float)255 * (hue * 2 - 1), (float)0);
+  color.r = std::max((float)255 * (1 - 2 * hue), (float)0) * 0.094 * 2.5;
+  color.g = std::max(min(hue * 2 * 255, (1 - hue) * 2 * 255), (float)0) * 0.113 * 2.5;
+  color.b = std::max((float)255 * (hue * 2 - 1), (float)0) * 0.080 * 2.5;
   return color;
 }
 
-void printTemplateLeds()
-{
-  Serial.println();
-  Serial.print("const CRGB templateLeds[] PROGMEM = {");
-  for (int i = 0; i < numLeds; i++)
-  {
-    if (i % 10 == 0) Serial.println();
-    Serial.print("{");
-    Serial.print(templateLeds[i][0]);
-    Serial.print(", ");
-    Serial.print(templateLeds[i][1]);
-    Serial.print(", ");
-    Serial.print(templateLeds[i][2]);
-    Serial.print("}");
-    Serial.print(", ");
-  }
-  Serial.println("};");
-}
-
-void generateTemplateHSV()
-{
-  for  (int i = 0; i < BANDS; i++)
-  {
-    for (int j = 0; j < 16; j++)
-    {
-      // Serial.println(String("CHSV ") + (i * 160 / 31) + " " + (255 - 128 * j / 15) + " 16");
-      // CRGB color = CHSV(i * 160 / 31, 255, 255);
-      // CRGB color = CHSV(powf(i, 1.5) / powf(31, 1.5) * 160.0, 255, 255);
-      CRGB color = redToBlue(powf((float)i / (BANDS - 1), 1.6));
-      templateLeds[i * 16 + j].r = color.r / 11;
-      templateLeds[i * 16 + j].g = color.g / 9;
-      templateLeds[i * 16 + j].b = color.b / 17;
-    }
-  }
-  printTemplateLeds();
-}
-*/
-
+/*
 void mapLeds()
 {
   for (int i = 0; i < BANDS; i++)
   {
     for (int j = 0; j < 16; j++)
     {
-      // if ((bands[i] * 16 - j) > 0) leds[(ledMap[i * 16 + j]) * 3 + 1] = 1;
-      // else leds[(ledMap[i * 16 + j]) * 3 + 1] = 0;
       if ((bands[i] * 16 - j) >= 0) leds[ledMap[i * 16 + j]] = templateLeds[i * 16 + j];
       else if ((bands[i] * 16 - j) > -1)
       {
-        leds[ledMap[i * 16 + j]][0] = ((float)templateLeds[i * 16 + j][0] + 1.0) * (bands[i] * 16.0 - j + 1.0);   // I add one to the color so that if it's small it doesn't disappear first. now if the color is one, it will disappear in the middle.
-        leds[ledMap[i * 16 + j]][1] = ((float)templateLeds[i * 16 + j][1] + 1.0) * (bands[i] * 16.0 - j + 1.0);
-        leds[ledMap[i * 16 + j]][2] = ((float)templateLeds[i * 16 + j][2] + 1.0) * (bands[i] * 16.0 - j + 1.0);
+        leds[ledMap[i * 16 + j]].r = ((float)templateLeds[i * 16 + j].r + 1.0) * (bands[i] * 16.0 - j + 1.0);   // I add one to the color so that if it's small it doesn't disappear first. now if the color is one, it will disappear in the middle.
+        leds[ledMap[i * 16 + j]].g = ((float)templateLeds[i * 16 + j].g + 1.0) * (bands[i] * 16.0 - j + 1.0);
+        leds[ledMap[i * 16 + j]].b = ((float)templateLeds[i * 16 + j].b + 1.0) * (bands[i] * 16.0 - j + 1.0);
       }
-      else leds[ledMap[i * 16 + j]] = CRGB::Black;
+      else leds[ledMap[i * 16 + j]] = {0, 0, 0};
+    }
+  }
+}
+*/
+
+/*
+void mapLeds()
+{
+  for (int x = 0; x < SCREEN_WIDTH; x++)
+  {
+    for (int y = 0; y < SCREEN_HEIGHT; y++)
+    {
+        leds[x + y * SCREEN_WIDTH].r = 4;
+    }
+  }
+}
+*/
+
+void mapLeds(float* bands)
+{
+  for (int x = 0; x < BANDS; x++)
+  {
+    CRGB color = redToBlue(((float)x / (BANDS - 1)) * sqrtApprox((float)x / (BANDS - 1)));
+    for (int y = 0; y < SCREEN_HEIGHT; y++)
+    {
+      if ((bands[x] * SCREEN_HEIGHT - (SCREEN_HEIGHT - 1 - y)) >= 0) leds[x + SCREEN_WIDTH * y] = color;
+      else if ((bands[x] * SCREEN_HEIGHT - (SCREEN_HEIGHT - 1 - y)) > -1)
+      {
+        leds[x + SCREEN_WIDTH * y].r = ((float)color.r + 0.999) * (bands[x] * SCREEN_HEIGHT - (SCREEN_HEIGHT - 1 - y) + 0.999);
+        leds[x + SCREEN_WIDTH * y].g = ((float)color.g + 0.999) * (bands[x] * SCREEN_HEIGHT - (SCREEN_HEIGHT - 1 - y) + 0.999);
+        leds[x + SCREEN_WIDTH * y].b = ((float)color.b + 0.999) * (bands[x] * SCREEN_HEIGHT - (SCREEN_HEIGHT - 1 - y) + 0.999);
+      }
+      else leds[x + SCREEN_WIDTH * y] = {0, 0, 0};
     }
   }
 }
 
-/*
-void generateBinIntervals()
+void mapLeds_textures(int x, FloatOffset groundOffset, FloatOffset skyOffset, float* bands)
 {
-  for (int i = 0; i < BANDS + 1; i++)
+    // CRGB color = redToBlue(((float)x / (BANDS - 1)) * sqrtApprox((float)x / (BANDS - 1)));
+    for (int y = 0; y < SCREEN_HEIGHT; y++)
+    {
+      CRGB groundColor = ((CRGB*)yellow_sand)[((y + (int)groundOffset.y) % TILE_HEIGHT) * TILE_WIDTH + (x + (int)groundOffset.x) % TILE_WIDTH];
+      groundColor.r = groundColor.r / 4;
+      groundColor.g = groundColor.g / 64;
+      groundColor.b = groundColor.b / 64;
+      CRGB skyColor = ((CRGB*)dark_blue_water)[((y + (int)skyOffset.y) % TILE_HEIGHT) * TILE_WIDTH + (x + (int)skyOffset.x) % TILE_WIDTH];
+      skyColor.r = skyColor.r / 64;
+      skyColor.g = skyColor.g / 64;
+      skyColor.b = skyColor.b / 64;
+      /*
+      uint8_t r = groundColor.r;
+      groundColor.r = groundColor.g;
+      groundColor.g = r;
+      */
+      if ((bands[x] * SCREEN_HEIGHT - (SCREEN_HEIGHT - 1 - y)) >= 0)
+      {
+        leds[x + SCREEN_WIDTH * y] = groundColor;
+      }
+      else if ((bands[x] * SCREEN_HEIGHT - (SCREEN_HEIGHT - 1 - y)) > -1)
+      {
+        float skyPortion = SCREEN_HEIGHT - 1 - y - bands[x] * SCREEN_HEIGHT;
+        float groundPortion = 1 - skyPortion;
+        leds[x + SCREEN_WIDTH * y].r = (float)groundColor.r * groundPortion + (float)skyColor.r * skyPortion;
+        leds[x + SCREEN_WIDTH * y].g = (float)groundColor.g * groundPortion + (float)skyColor.g * skyPortion;
+        leds[x + SCREEN_WIDTH * y].b = (float)groundColor.b * groundPortion + (float)skyColor.b * skyPortion;
+      }
+      else
+      {
+        leds[x + SCREEN_WIDTH * y] = skyColor;
+      }
+    }
+}
+
+void drawCharacter(const CRGB* character, float startingColumn, float offSet, float columnsPerFrame, int numberOfFrames, int frameWidth, int frameHeight)
+{
+  // int frame = (int)((startingColumn + offSet) / columnsPerFrame) % numberOfFrames;
+  int frame = (int)((startingColumn + offSet) / columnsPerFrame) % numberOfFrames;
+  // frame = 0;
+  for (int x = (int)(startingColumn + 100) - 100; x < (int)startingColumn + frameWidth; x++)
   {
-    if (SAMPLES == 4096 && BANDS == 64) binIntervals[i] = bins_4096_64[i];
-    if (SAMPLES == 4096 && BANDS == 48) binIntervals[i] = bins_4096_48[i];
-    if (SAMPLES == 4096 && BANDS == 32) binIntervals[i] = bins_4096_32[i];
-    if (SAMPLES == 4096 && BANDS == 16) binIntervals[i] = bins_4096_16[i];
-    
-    if (SAMPLES == 2048 && BANDS == 64) binIntervals[i] = bins_2048_64[i];
-    if (SAMPLES == 2048 && BANDS == 48) binIntervals[i] = bins_2048_48[i];
-    if (SAMPLES == 2048 && BANDS == 32) binIntervals[i] = bins_2048_32[i];
-    if (SAMPLES == 2048 && BANDS == 16) binIntervals[i] = bins_2048_16[i];
+    if (x >= 0 && x < SCREEN_WIDTH)
+    {
+      for (int y = SCREEN_HEIGHT - frameHeight; y < SCREEN_HEIGHT; y++)
+      {
+        int characterPixel = x - (int)(startingColumn + 100) + 100 + frame * frameWidth + (y - SCREEN_HEIGHT + frameHeight) * (numberOfFrames * frameWidth);
+        // if (character[characterPixel].r != 0xFE && character[characterPixel].g != 0xFD && character[characterPixel].b != 0xFC)
+        if ((*(uint32_t*)&(character[characterPixel]) & 0x00FFFFFF) != 0x00FCFDFE)    // I don't know why it's not 0xFEFDFC. It's because esp32 is little endian.
+        {
+          leds[x + y * SCREEN_WIDTH].r = character[characterPixel].r / 16;
+          leds[x + y * SCREEN_WIDTH].g = character[characterPixel].g / 16;
+          leds[x + y * SCREEN_WIDTH].b = character[characterPixel].b / 16;
+        }
+      }
+    }
   }
-  if (binIntervals[BANDS] > SAMPLES / 2) binIntervals[BANDS] = SAMPLES / 2;
-  Serial.print("Last binInterval = ");
-  Serial.println(binIntervals[BANDS]);
+  
+}
+
+
+
+/*
+void mapLeds()     // upside down
+{
+  for (int x = 0; x < BANDS; x++)
+  {
+    CRGB color = redToBlue(((float)x / (BANDS - 1)) * sqrtApprox((float)x / (BANDS - 1)));
+    for (int y = 0; y < SCREEN_HEIGHT; y++)
+    {
+      if ((bands[x] * SCREEN_HEIGHT - y) >= 0) leds[x + SCREEN_WIDTH * y] = color;
+      else if ((bands[x] * 32 - y) > -1)
+      {
+        leds[x + SCREEN_WIDTH * y].r = ((float)color.r + 0.999) * (bands[x] * SCREEN_HEIGHT - y + 0.999);
+        leds[x + SCREEN_WIDTH * y].g = ((float)color.g + 0.999) * (bands[x] * SCREEN_HEIGHT - y + 0.999);
+        leds[x + SCREEN_WIDTH * y].b = ((float)color.b + 0.999) * (bands[x] * SCREEN_HEIGHT - y + 0.999);
+      }
+      else leds[x + SCREEN_WIDTH * y] = {0, 0, 0};
+    }
+  }
 }
 */
 
-/*
-void createWindowing(float a, float multiplier)
-{
-  float temp = 0;
-  Serial.print("const float windowingArray[] PROGMEM = {");
-  for (int i = 0; i < SAMPLES; i++)
-  {
-    temp = ((float)a - (1.0 - a) * (cos(TWO_PI * (float)i / (float)(SAMPLES - 1)))) * multiplier;    // a = 0.5 (Hann), a = 0.54 (Hamming)
-    if (a == -1) temp = (0.44959 - (0.49364 * (cos(TWO_PI * (float)i / (float)(SAMPLES - 1)))) + (0.05677 * (cos(2 * TWO_PI * (float)i / (float)(SAMPLES - 1))))) * multiplier;    // Blackman
-    if (a == -2) temp = (0.42323 - (0.49755 * (cos(TWO_PI * (float)i / (float)(SAMPLES - 1)))) + (0.07922 * (cos(2 * TWO_PI * (float)i / (float)(SAMPLES - 1))))) * multiplier;    // Blackman
-    if (a == -3) temp = 1 * multiplier;     // -3 equals no windowing
-    if (a == -4) temp = (0.21557895
-        - 0.416631580 * cos(1 * TWO_PI * (float)i / (float)(SAMPLES - 1))
-        + 0.277263158 * cos(2 * TWO_PI * (float)i / (float)(SAMPLES - 1))
-        - 0.083578947 * cos(3 * TWO_PI * (float)i / (float)(SAMPLES - 1))
-        + 0.006947368 * cos(4 * TWO_PI * (float)i / (float)(SAMPLES - 1))) * multiplier;    // flat top
-    if (a == -5) temp = (0.355768
-        - 0.487396 * cos(1 * TWO_PI * (float)i / (float)(SAMPLES - 1))
-        + 0.144232 * cos(2 * TWO_PI * (float)i / (float)(SAMPLES - 1))
-        - 0.012604 * cos(3 * TWO_PI * (float)i / (float)(SAMPLES - 1))
-        + 0.0 * cos(4 * TWO_PI * (float)i / (float)(SAMPLES - 1))) * multiplier;    // nuttal
-    if (i % 10 == 0) Serial.println();
-    Serial.print(temp, 10);
-    Serial.print(", ");
-  }
-  Serial.println("};");
-}
-*/
-
-void doWindowing()
+void doWindowing(float* inputReal)
 {
   // first we calculate the average of the signal so we can remove any dc offset
   float average = 0;
@@ -316,12 +366,9 @@ void doWindowing()
   }
 }
 
-
 void audio_data_callback(const uint8_t *data, uint32_t byteLen)
 {
   int actualLen = byteLen / 4;
-  // int free = (mHead - mTail + mSize - 1)%mSize;
-  // if ((readIndex - writeIndex + BUFFER_LENGTH - 1) % BUFFER_LENGTH <= BUFFER_LENGTH / 4)
   if ((readIndex - writeIndex + BUFFER_LENGTH - 1) % BUFFER_LENGTH <= actualLen)
   {
     bufferFull++;
@@ -335,33 +382,7 @@ void audio_data_callback(const uint8_t *data, uint32_t byteLen)
     }
   }
   writeIndex = (writeIndex + actualLen) % BUFFER_LENGTH;
-  /*
-  else if (writeIndex + actualLen <= BUFFER_LENGTH)
-  {
-    // memcpy(&bufferRing[writeIndex], &data[0], len);
-    for (int i = i; i < actualLen; i++)
-    {
-      // bufferRing[writeIndex + i] = (int16_t)(((int)*(int16_t*)&(data[readIndex * 4]) + (int)*(int16_t*)&(data[readIndex * 4 + 2])));
-      bufferRing[writeIndex + i] = *(int16_t*)&(data[readIndex * 4]) / 2 + *(int16_t*)&(data[readIndex * 4 + 2]);
-    }
-    writeIndex = (writeIndex + actualLen) % (BUFFER_LENGTH);
-  }
-  else
-  {
-    int written = BUFFER_LENGTH - writeIndex;
-    for (int i = i; i < written; i++)
-    {
-      // bufferRing[writeIndex + i] = (int16_t)(((int)*(int16_t*)&(data[readIndex * 4]) + (int)*(int16_t*)&(data[readIndex * 4 + 2])));
-      bufferRing[writeIndex + i] = *(int16_t*)&(data[readIndex * 4]) / 2 + *(int16_t*)&(data[readIndex * 4 + 2]);
-    }
-    for (int i = i; i < actualLen - written; i++)
-    {
-      bufferRing[i] = *(int16_t*)&(data[(written + i) * 4]) / 2 + *(int16_t*)&(data[(written + i) * 4 + 2]);
-    }
-    // memcpy(&bufferRing[0], &data[written], len - written);
-    writeIndex = (writeIndex + actualLen) % (BUFFER_LENGTH);
-  }
-  */
+  
   #ifdef PRINT_INDEXES
   Serial.print("Got ");
   Serial.print(actualLen);
@@ -370,38 +391,11 @@ void audio_data_callback(const uint8_t *data, uint32_t byteLen)
   #endif
 }
 
-/* This used the float. I had to switch to int16_t to save 16 kB
-void audio_data_callback(const uint8_t *data, uint32_t len)
-{
-  // int free = (mHead - mTail + mSize - 1)%mSize;
-  // if ((readIndex - writeIndex + BUFFER_LENGTH - 1) % BUFFER_LENGTH <= BUFFER_LENGTH / 4)
-  if ((readIndex - writeIndex + BUFFER_LENGTH - 1) % BUFFER_LENGTH <= len)
-  {
-    bufferFull++;
-  }
-  else if (writeIndex + len <= BUFFER_LENGTH)
-  {
-    memcpy(&bufferRing[writeIndex], &data[0], len);
-    writeIndex = (writeIndex + len) % BUFFER_LENGTH;
-  }
-  else
-  {
-    int written = BUFFER_LENGTH - writeIndex;
-    memcpy(&bufferRing[writeIndex], &data[0], written);
-    memcpy(&bufferRing[0], &data[written], len - written);
-    writeIndex = (writeIndex + len) % BUFFER_LENGTH;
-  }
-  #ifdef PRINT_INDEXES
-  Serial.println(String("Got ") + len + " data, writeIndex = " + writeIndex);
-  #endif
-}
-*/
-
 void startAudio()
 {
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t) (I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = 16000, // updated automatically by A2DP
+    .sample_rate = 44100, // updated automatically by A2DP
     .bits_per_sample = (i2s_bits_per_sample_t)16,
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = (i2s_comm_format_t) (I2S_COMM_FORMAT_STAND_I2S),
@@ -414,13 +408,22 @@ void startAudio()
   a2dp_sink.set_i2s_config(i2s_config);
   a2dp_sink.set_i2s_port(I2S_NUM_1);
   a2dp_sink.set_stream_reader(audio_data_callback);
+  
+  i2s_pin_config_t my_pin_config = {
+      .bck_io_num = 4,
+      .ws_io_num = 15,
+      .data_out_num = 16,
+      .data_in_num = I2S_PIN_NO_CHANGE };
+  a2dp_sink.set_pin_config(my_pin_config);
+  // a2dp_sink.set_auto_reconnect(false);    // maybe this helps with my compatibility problem
+  
   a2dp_sink.start(BTname);
   Serial.println(String("Started Bluetooth audio receiver with the name ") + BTname);
 }
 
-bool readBuffer()
+bool readBuffer(float* inputReal)
 {
-  int newSamples = min((int)SAMPLES, a2dp_sink.i2s_config.sample_rate / frameRate);
+  int newSamples = min(min(SAMPLES, a2dp_sink.sample_rate() * (int)loopMicros / 990000), BUFFER_LENGTH);
   if ((writeIndex - readIndex + BUFFER_LENGTH) % BUFFER_LENGTH < newSamples / 2)   // i only ask for half as many samples to be present
   {
     // delay(1);
@@ -462,65 +465,29 @@ bool readBuffer()
   return true;
 }
 
-/* This used the float. I had to switch to int16_t to save 16 kB
-bool readBuffer()
-{
-  int newSamples = min(SAMPLES, a2dp_sink.i2s_config.sample_rate / frameRate);
-  if ((writeIndex - readIndex + BUFFER_LENGTH) % BUFFER_LENGTH < newSamples * 2)   // newSamples should be multiplied by four but by multiplying it by 2 i only ask for half as many samples to be present
-  {
-    // delay(1);
-    return false;
-  }
-  if ((writeIndex - readIndex + BUFFER_LENGTH) % BUFFER_LENGTH < newSamples * 4)
-  {
-    // delay(1);
-    newSamples = ((writeIndex - readIndex + BUFFER_LENGTH) % BUFFER_LENGTH) / 4;
-    lesserSamples = newSamples;
-  }
-  
-  {
-    for (int i = 0; i < newSamples; i++)
-    {
-      realRing[realRingIndex] = (float)*(int16_t*)&(bufferRing[readIndex]) + (float)*(int16_t*)&(bufferRing[readIndex + 2]);
-      realRingIndex = (realRingIndex + 1) % SAMPLES;
-      readIndex = (readIndex + 4) % BUFFER_LENGTH;
-    }
-    #ifdef PRINT_INDEXES
-    Serial.println(String("readIndex = ") + readIndex + ", realRingIndex = " + realRingIndex);
-    #endif
-  }
-
-  memcpy(&inputReal[0], &realRing[realRingIndex], (SAMPLES - realRingIndex) * sizeof(float));
-  memcpy(&inputReal[SAMPLES - realRingIndex], &realRing[0], (realRingIndex) * sizeof(float));
-  return true;
-}
-*/
-
-void powerOfTwo()
+void powerOfTwo(float* output)
 {
   for (int index = 0; index < SAMPLES / 2; index++)
   {
-    // Serial.println(String(index) + ": " + output[index * 2]);
     output[index] = output[index * 2] * output[index * 2] + output[index * 2 + 1] * output[index * 2 + 1];
-    // output[index] = output[index * 2] * output[index * 2]; // + output[index * 2 + 1] * output[index * 2 + 1];
-    // outputPowTwo[index] = output[index * 2];
   }
 }
 
-float sqrtApprox(float number)
-{
-  union { float f; uint32_t u; } y = {number};
-  y.u = 0x5F1FFFF9ul - (y.u >> 1);
-  return number * 0.703952253f * y.f * (2.38924456f - number * y.f * y.f);
-}
-
-void powTwoBands()
+void powTwoBands(float* output, float* bands)
 {
   for (int i = 0; i < BANDS; i++)
   {
     bands[i] = 0;
     #if SAMPLES == 4096
+    #if BANDS == 112
+    for (int j = bins_4096_112[i]; j < bins_4096_112[i + 1]; j++)
+    #endif
+    #if BANDS == 64
     for (int j = bins_4096_64[i]; j < bins_4096_64[i + 1]; j++)
+    #endif
+    #if BANDS == 7
+    for (int j = bins_4096_7[i]; j < bins_4096_7[i + 1]; j++)
+    #endif
     #endif 
     #if SAMPLES == 2048
     for (int j = bins_2048_64[i]; j < bins_2048_64[i + 1]; j++)
@@ -531,13 +498,16 @@ void powTwoBands()
   }
 }
 
-void logBands()
+void logBands(float* bands, float* peakBands)
 {
   for (int i = 0; i < BANDS; i++)
   {
     bands[i] = log10f(bands[i]);
     #ifdef PRINT_PEAKS
     if (peakBands[i] < bands[i]) peakBands[i] = bands[i];
+    #endif
+    #if BANDS == 7
+    bands[i] = bands[i] - substract_7[i] + 6;
     #endif
     #if BANDS == 16
     bands[i] = bands[i] - substract_16[i] + 6;
@@ -551,10 +521,13 @@ void logBands()
     #if BANDS == 64
     bands[i] = bands[i] - substract_64[i] + 6;
     #endif
+    #if BANDS == 112
+    bands[i] = bands[i] - substract_112[i] + 6;
+    #endif
   }
 }
 
-void normalizeBands()
+void normalizeBands(float* bands)
 {
   static float bandCeiling = 0.1;
   #ifdef PRINT_CEILING
@@ -571,7 +544,7 @@ void normalizeBands()
   }
 }
 
-void zeroSmallBins()
+void zeroSmallBins(float* output)
 {
   float biggest = 0;
   for (int i = 0; i < SAMPLES / 2; i++)
@@ -591,9 +564,9 @@ void setup()
   #ifdef USE_SERIAL
   Serial.begin(115200);
   #endif
+  programMode = bluetooth;
+  Serial.printf("programMode = %d\n\r", programMode);
   Serial.println("Just booted up");
-  // Serial.println(String(testSqrt(1000) * 1000000) + " is the maximum error of sqrtApprox");
-  
   Serial.print("ESP.getFreeHeap() = ");
   Serial.println(ESP.getFreeHeap());
   Serial.print("heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) = ");
@@ -601,118 +574,245 @@ void setup()
   Serial.print("heap_caps_get_largest_free_block(MALLOC_CAP_32BIT) = ");
   Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_32BIT));
   delay(100);
+  
+  Serial.printf("numLeds = %d\n", numLeds);
+  Serial.printf("SCREEN_WIDTH = %d\n", SCREEN_WIDTH);
+  Serial.printf("SCREEN_HEIGHT = %d\n", SCREEN_HEIGHT);
+    
+  int pins[] = {32, 33, 25, 26, 27, 14, 12, 23, 22, 21, 19, 18, 5, 17};              // esp32 dev kit v1
+  #ifndef WAIT_UNTIL_DRAWING_DONE
+  driver.__displayMode = NO_WAIT;
+  #endif
+  leds = (CRGB*)calloc(numLeds, sizeof(CRGB));
+  driver.initled((uint8_t*)leds, pins, NUM_PANELS_PER_ROW * NUM_PANELS_PER_COLUMN, PANEL_WIDTH * PANEL_HEIGHT, ORDER_GRB);
+  driver.setMapLed(mapLed);
+  // These two lines have to be after driver.initled()
+  driver._offsetDisplay.panel_width=SCREEN_WIDTH;
+  driver._offsetDisplay.panel_height=SCREEN_HEIGHT;
+  
+  offd = driver.getDefaultOffset();
+  offd.panel_width=SCREEN_WIDTH;
+  offd.panel_height=SCREEN_HEIGHT;
 
-  // with 0.543478261 it's Hamming windowing. with 0.5 it's Hann windowing
-  // we also get free scaling because we can scale the windowing array in advance
-  // createWindowing(25.0/46.0, 1.0/256.0);  // 1.0/32.0 is the lowest sane minimum   // doesn't need to be a power of two. just a habit
-  // createWindowing(-1, 1.0/256.0);  // a = 1 creates Blackman window -61 dB
-  // createWindowing(-4, 1.0/256.0);  // a = -4 creates flat top window -67 dB
-  // createWindowing(-2, 1.0/256.0);  // a = -1 creates no windowing
-  // Reducing side lobes is quite a problem since in the last bands I add like a hundred of them together. That exarbates the problem by 20 dB. That's not neglible.
+  Serial.printf("driver._offsetDisplay.panel_width = %d\n", driver._offsetDisplay.panel_width);
+  Serial.printf("driver._offsetDisplay.panel_height = %d\n", driver._offsetDisplay.panel_height);
   
-  // createWindowing(-2, 1.0/256.0);  // a = 0.5 Hann windowing <= this one is my current preference because the side lobes very far away will be quite reduced
-  // delay(1000);
-  // generateBinIntervals();
+  groundOffset.x = 0;
+  groundOffset.y = 0;
+  skyOffset.x = 0;
+  skyOffset.y = 0;
   
-  // generateTemplateHSV();
-  
-  // Serial.println("1");
-  // leds = (uint8_t *)malloc(sizeof(uint8_t) * numLeds * 3);
-  for (int i = 0; i < sizeof(uint8_t) * numLeds * 3; i++)
-  {
-    leds[i] = 0;
-  }
-  // Serial.println("2");
-  
-  // generateLedMap();
-  
-  // Serial.println("3");
-  // driver.initled((uint8_t*)leds, pins, 2, 256, ORDER_GRB);
-  FastLED.addLeds<NEOPIXEL, 33>(leds, 0*256, 256);
-  #if BANDS > 16
-  FastLED.addLeds<NEOPIXEL, 32>(leds, 1*256, 256);
-  #if BANDS > 32
-  FastLED.addLeds<NEOPIXEL, 12>(leds, 2*256, 256);
-  #if BANDS > 48
-  FastLED.addLeds<NEOPIXEL, 14>(leds, 3*256, 256);
-  /*
-  FastLED.addLeds<NEOPIXEL, 16>(leds, 3*256, 256);
-  FastLED.addLeds<NEOPIXEL, 17>(leds, 3*256, 256);
-  FastLED.addLeds<NEOPIXEL, 18>(leds, 3*256, 256);
-  FastLED.addLeds<NEOPIXEL, 19>(leds, 3*256, 256);
-  */
-  #endif
-  #endif
-  #endif
-  FastLED.setMaxPowerInVoltsAndMilliamps(5, maxCurrent);
-
   startAudio();
-
+  Serial.print("ESP.getFreeHeap() = ");
+  Serial.println(ESP.getFreeHeap());
+  Serial.print("heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) = ");
+  Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  Serial.print("heap_caps_get_largest_free_block(MALLOC_CAP_32BIT) = ");
+  Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_32BIT));
+  driver.showPixels();    // I do this to test if I made a mistake in ClocklessLED library
+  delay(100);
+  
+  pinMode(13, OUTPUT);
+  digitalWrite(13, LOW);
+  // gpio_set_direction((gpio_num_t)13, GPIO_MODE_OUTPUT);
+  // gpio_set_level((gpio_num_t)13, 0);
+  
 }
 
-void loop()
+void loopBluetooth()
 {
-  static unsigned int beebBoob = 178;
-  beebBoob++;
-  for (;;)
-  {
-    if (readBuffer()) break;
-    else delayMicroseconds(100);
-  }
-
-  // debug("buffer read");
-  #ifdef PRINT_FFT_TIME
-  unsigned int fftMicros = micros();
+  
+  static float* inputReal = (float*)calloc(SAMPLES, sizeof(float));
+  static float* output = (float*)calloc(SAMPLES, sizeof(float));
+  static fft_config_t* fftReal = fft_init(SAMPLES, FFT_REAL, FFT_FORWARD, inputReal, output);
+  static float* bands = (float*)calloc(BANDS, sizeof(float));
+  #ifdef PRINT_PEAKS
+  static float* peakBands = (float*)calloc(BANDS, sizeof(float));
+  #else
+  static float* peakBands;
   #endif
   
-  doWindowing();
-  // debug("windowing done");
-  fft_execute(fftReal);
-  #ifdef PRINT_PLOT
-  plot();
-  #endif
-  // plotInput();
-  // debug("fftReal executed");
-  powerOfTwo();   // if we end up doing log() of the output anyways there is no need to do costly sqrt() because it's the same as dividing log() by 2
-  // sqrtBins();     // we don't actually need this since we are dealing with the power of the signal and not the amplitude
-  // Serial.println(String("sqrt took ") + (micros() - sqrtMicros) + " μs");
-  zeroSmallBins();  // we do this because there are plenty of of reflections in the surrounding bins
-  // debug("powerOfTwo");
-  // I'll have to get rid of powTwoBands and actually do sqrt() on every bin since I'm goin to add them all up
-  powTwoBands();
-  logBands();
-  normalizeBands();
-  // superNormalizeBands();      // maybe we'll do something like this later. now i need full info for debugging and testing
-
-  #ifdef PRINT_BANDS
-  printBands();
-  #endif
-  // printOutput();
-  // logFFT();     // logarithm is super costly. that's why we only do it once per band instead of once per bin in the logBands()
-  // debug("logFFT");
-  // if (PLOTTER) plot();
-  // Serial.println("5");
-  mapLeds();
-  // Serial.println("6");
-  // driver.setBrightness(limitCurrent(leds, numLeds, maxCurrent, maxBrightness));
-  // Serial.println("7");
-  #ifdef PRINT_FFT_TIME
-  if (beebBoob % 179 == 0)
+  static unsigned int beebBoob = 178;
+  static uint32_t previousMicros = 0;
+  static uint32_t previousCycles = 0;
+  uint32_t newMicros = micros();
+  uint32_t newCycles = xthal_get_ccount();
+  static uint32_t previousDebugMillis = 0;
+  loopMicros = newMicros - previousMicros;
+  loopCycles = newCycles - previousCycles;
+  previousMicros = newMicros;
+  previousCycles = newCycles;
+  if (previousDebugMillis == 0)
   {
-    Serial.print("FFT took ");
-    Serial.print(micros() - fftMicros);
-    Serial.println(" μs");
+    previousDebugMillis = 1;
+    Serial.print("ESP.getFreeHeap() = ");
+    Serial.println(ESP.getFreeHeap());
+    Serial.print("heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) = ");
+    Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    Serial.print("heap_caps_get_largest_free_block(MALLOC_CAP_32BIT) = ");
+    Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_32BIT));
   }
+  
+  while (true)
+  {
+    if (readBuffer(inputReal)) break;
+    else
+    {
+      vTaskDelay(1);
+      previousMicros = micros();
+      previousCycles = xthal_get_ccount();
+    }
+  }
+
+
+  #ifdef PRINT_FFT_TIME
+  uint32_t fftMicros = micros();
+  uint32_t fftCycles = xthal_get_ccount();
   #endif
+  
+  doWindowing(inputReal);
+  fft_execute(fftReal);
+  powerOfTwo(output);   // if we end up doing log() of the output anyways there is no need to do costly sqrt() because it's the same as dividing log() by 2
+  // sqrtBins();     // we don't actually need this since we are dealing with the power of the signal and not the amplitude
+  zeroSmallBins(output);  // we do this because there are plenty of of reflections in the surrounding bins
+  powTwoBands(output, bands);
+  logBands(bands, peakBands);
+  normalizeBands(bands);
+  
+  groundOffset.x += 0.03;
+  groundOffset.y += 0.5;
+  skyOffset.x += 0.23;
+  skyOffset.y += 0.05;
+  if (groundOffset.x < 0) groundOffset.x += TILE_WIDTH;
+  if (groundOffset.y < 0) groundOffset.y += TILE_HEIGHT;
+  if (skyOffset.x < 0) skyOffset.x += TILE_WIDTH;
+  if (skyOffset.y < 0) skyOffset.y += TILE_HEIGHT;
+  
+  #ifdef PRINT_FFT_TIME
+  fftMicros = micros() - fftMicros;
+  fftCycles = xthal_get_ccount() - fftCycles;
+  #endif
+  #ifndef WAIT_UNTIL_DRAWING_DONE
+  driver.waitUntilDone();
+  #endif
+  
   #ifdef PRINT_RAM
-  int heap_caps_get_largest_free_block_8bit_min = 1000000000;
-  int heap_caps_get_largest_free_block_32bit_min = 1000000000;
+  // I had to move these commands here because they bothered I2SCloclessLedDriver
+  // They do something that blocks the interruots or something
+  // I was getting pretty garbled results just because of this
+  // I had to wait until I2SCloclessLedDriver was done drawing the leds
+  static int heap_caps_get_largest_free_block_8bit_min = 1000000000;
+  static int heap_caps_get_largest_free_block_32bit_min = 1000000000;
   int newValue = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   if (newValue < heap_caps_get_largest_free_block_8bit_min) heap_caps_get_largest_free_block_8bit_min = newValue;
   newValue = heap_caps_get_largest_free_block(MALLOC_CAP_32BIT);
   if (newValue < heap_caps_get_largest_free_block_32bit_min) heap_caps_get_largest_free_block_32bit_min = newValue;
-  if (beebBoob % 179 == 0)
+  #endif
+  
+  uint32_t mapLedsMicros = micros();
+  uint32_t mapLedsCycles = xthal_get_ccount();
+  
+  // mapLeds();
+  // mapLeds_mario();
+  // driver.ledToDisplay will be needed next
+  for (int x = 0; x < SCREEN_WIDTH; x++)
   {
+    mapLeds_textures(x, groundOffset, skyOffset, bands);
+  }
+  
+  // drawCharacter(CRGB* character, float startingColumn, float offset, int columnsPerFrame, int numberOfFrames, int frameWidth, int frameHeight)
+  static uint32_t characterNumber = 0;
+  static int frameWidth = 32;
+  static int frameHeight = 32;
+  static int numberOfFrames = 8;
+  static const CRGB* currentCharacter = (const CRGB*)tuxes_walking;
+  static float columnsPerFrame = 1.5;
+  static float offset = 100.4 + ((double)esp_random() / (double)4194304);
+  static float startingColumn = 0 - frameWidth;
+  // [frameHeight * 2 * (characterNumber % 11) * 3 * frameWidth * numberOfFrames]
+  drawCharacter(currentCharacter, startingColumn, offset, columnsPerFrame, numberOfFrames, frameHeight, frameWidth);
+  startingColumn += 0.2;
+  if (startingColumn > SCREEN_WIDTH + frameWidth + 4)
+  {
+    characterNumber = (characterNumber + 1) % 24;
+    {
+      currentCharacter = (const CRGB*)tuxes_walking + characterNumber * frameHeight * frameWidth * numberOfFrames;
+      frameWidth = 32;
+      frameHeight = 32;
+      numberOfFrames = 8;
+    }
+    // offset = 100.4 + (float)esp_random() / 1000000.4;
+    offset = 100.4 + ((double)esp_random() / (double)4194304);
+    if ((characterNumber % 2) == 0)
+    {
+      columnsPerFrame = 1.5;
+    }
+    else
+    {
+      columnsPerFrame = 2;
+    }
+    if (characterNumber == 22)
+    {
+      currentCharacter = (const CRGB*)guido_walking;
+      frameWidth = 32;
+      frameHeight = 32;
+      numberOfFrames = 8;
+      columnsPerFrame = 2; 
+    }
+    if (characterNumber == 23)
+    {
+      currentCharacter = (const CRGB*)squirrel_walking;
+      frameWidth = 20;
+      frameHeight = 20;
+      numberOfFrames = 6;
+      columnsPerFrame = 2;
+    }
+    startingColumn = 0 - frameWidth - 4;
+    // Serial.printf("Color of the first pixel is %u\n\r", (*(uint32_t*)&(currentCharacter[0])));
+    // it should be 16711164;
+    // it's actually 4277992958 because the cpu is little endian
+    // that means that the last byte of the number is stored in the beginning
+    // all the bytes in a number are in reverse order
+    // back in the day when the bit width of the memory lane was less than the bit width of the cpu
+    // it allowed the cpu to start the calculations one clock cycle before it got the whole number
+  }
+  mapLedsMicros = micros() - mapLedsMicros;
+  mapLedsCycles = xthal_get_ccount() - mapLedsCycles;
+  
+  uint32_t showPixelsMicros = micros();
+  uint32_t showPixelsCycles = xthal_get_ccount();
+  
+  // driver.showPixels((uint8_t *)leds);
+  // driver.showPixels(offd);
+  // leds[8 * SCREEN_WIDTH + 51].r = 255;
+  // leds[8 * SCREEN_WIDTH + 51].g = 255;
+  // leds[8 * SCREEN_WIDTH + 51].b = 255;
+  driver.showPixels();
+
+  showPixelsMicros = micros() - showPixelsMicros;
+  showPixelsCycles = xthal_get_ccount() - showPixelsCycles;
+  
+  #ifdef PRINT_PLOT
+  plot();
+  #endif
+  #ifdef PRINT_BANDS
+  printBands();
+  #endif
+  
+  if (millis() - previousDebugMillis > SECONDS_BETWEEN_DEBUG * 1000)
+  {
+    previousDebugMillis = millis();
+    Serial.printf("driver._offsetDisplay.panel_width = %d\n", driver._offsetDisplay.panel_width);
+    Serial.printf("driver._offsetDisplay.panel_height = %d\n", driver._offsetDisplay.panel_height);
+
+    #ifdef PRINT_FFT_TIME
+    Serial.print("FFT took ");
+    Serial.print(fftMicros);
+    Serial.print(" ");
+    Serial.print((fftCycles) / 240);
+    Serial.println(" μs");
+    #endif
+    #ifdef PRINT_RAM
     Serial.print("ESP.getFreeHeap() = ");
     Serial.println(ESP.getFreeHeap());
     Serial.print("heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) = ");
@@ -721,78 +821,84 @@ void loop()
     Serial.println(heap_caps_get_largest_free_block_32bit_min);
     heap_caps_get_largest_free_block_8bit_min = 1000000000;
     heap_caps_get_largest_free_block_32bit_min = 1000000000;
-  }
-  #endif
-  // printLeds();
-  // driver.showPixels((uint8_t*)leds);
-  unsigned int fastledMicros = micros();
-  FastLED.show();
-  #ifdef PRINT_FASTLED_TIME
-  if (beebBoob % 179 == 0)
-  {
-    Serial.print("FastLED took ");
-    Serial.print(micros() - fastledMicros);
-    Serial.println(" μs");
-  }
-  #endif
-  #ifdef PRINT_SAMPLE_RATE
-  if (beebBoob % 179 == 0)
-  {
-    Serial.print("a2dp_sink.i2s_config.sample_rate = ");
-    Serial.println(a2dp_sink.i2s_config.sample_rate);
-  }
-  #endif
-  #ifdef PRINT_ALL_TIME
-  static unsigned int previousMicros;
-  unsigned int newMicros = micros();
-  if (beebBoob % 179 == 0)
-  {
+    #endif
+    #ifdef PRINT_FASTLED_TIME
+    Serial.print("driver.showPixels() took ");
+    Serial.print(showPixelsMicros);
+    Serial.print(" ");
+    Serial.print((showPixelsCycles) / 240);
+    Serial.println(" μs ");
+    #endif
+    #ifdef PRINT_MAPLEDS_TIME
+    Serial.print("MapLeds took ");
+    Serial.print(mapLedsMicros);
+    Serial.print(" ");
+    Serial.print((mapLedsCycles) / 240);
+    Serial.println(" μs ");
+    #endif
+    #ifdef PRINT_SAMPLE_RATE
+    Serial.print("a2dp_sink.sample_rate() = ");
+    Serial.println(a2dp_sink.sample_rate());
+    #endif
+    #ifdef PRINT_ALL_TIME
     Serial.print("everything took ");
-    Serial.print(newMicros - previousMicros);
-    Serial.print(" μs, FFT and FastLED took ");
-    Serial.print(newMicros - fftMicros);
+    Serial.print(loopMicros);
+    Serial.print(" ");
+    Serial.print((loopCycles) / 240);
     Serial.println(" μs");
-  }
-  #endif
-  // Serial.println(String("readIndex = ") + readIndex);
-  #ifdef PRINT_PEAKS
-  if (beebBoob % 179 == 0)
-  {
+    #endif
+    #ifdef PRINT_PEAKS
     Serial.print("Peak bands: ");
     for (int i = 0; i < BANDS; i++)
     {
-      Serial.print(peakBands[i] - 6);
-      Serial.print(", ");
+      Serial.printf("%f, ", peakBands[i] - 6.0);
     }
     Serial.println();
+    #endif
+    #ifdef PRINT_LESSER_SAMPLES
+    if (lesserSamples > 0)
+    {
+      Serial.print("lesserSamples = ");
+      Serial.println(lesserSamples);
+      lesserSamples = 0;
+    }
+    #endif
+    #ifdef PRINT_BUFFER_FULL
+    if (bufferFull > 0)
+    {
+      Serial.print("BUFFER FULL. DISCARDING DATA. BUFFER FULL. DISCARDING DATA. BUFFER FULL. bufferFull = ");
+      Serial.println(bufferFull);
+      bufferFull = 0;
+    }
+    #endif
   }
-  #endif
-  #ifdef PRINT_LESSER_SAMPLES
-  if ((beebBoob % 179 == 0) && (lesserSamples > 0))
-  {
-    Serial.print("lesserSamples = ");
-    Serial.println(lesserSamples);
-    lesserSamples = 0;
-  }
-  #endif
-  #ifdef PRINT_BUFFER_FULL
-  if ((beebBoob % 7727 == 0) && (bufferFull > 0))
-  {
-    Serial.print("BUFFER FULL. DISCARDING DATA. BUFFER FULL. DISCARDING DATA. BUFFER FULL. bufferFull = ");
-    Serial.println(bufferFull);
-    /*
-    newSamples += 10;
-    Serial.print("newSamples = ");
-    Serial.println(newSamples);
-    */
-    bufferFull = 0;
-  }
-  #endif
-  #ifdef PRINT_ALL_TIME
-  previousMicros = newMicros;
-  #endif
-  // delayMicroseconds(100);
   #ifdef TEST_FULL_BUFFER
-  delay(100);
+  delay(150);
   #endif
+}
+
+void loopMicrophone()
+{
+  
+}
+
+void loopArtnet()
+{
+  
+}
+
+void loop()
+{
+  switch(programMode)
+  {
+    case bluetooth:
+      while(true) loopBluetooth();
+      break;
+    case microphone:
+      while(true) loopMicrophone();
+      break;
+    case artnet:
+      while(true) loopArtnet();
+      break;
+  }
 }
