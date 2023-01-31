@@ -97,17 +97,21 @@ struct FloatOffset
   float y;
 };
 
-#include "constants.h"
-
 #define TILE_WIDTH 32
 #define TILE_HEIGHT 32
-#define ENABLE_LEDMAP
 #define PANEL_WIDTH 16
 #define PANEL_HEIGHT 16
 #define NUM_PANELS_PER_ROW 7
 #define NUM_PANELS_PER_COLUMN 2
 #define SCREEN_WIDTH PANEL_WIDTH * NUM_PANELS_PER_ROW
 #define SCREEN_HEIGHT PANEL_HEIGHT * NUM_PANELS_PER_COLUMN
+
+#define ENABLE_LEDMAP
+#define USE_LOCAL_LEDMAP
+#include "I2SClocklessLedDriver.h"
+
+#include "constants.h"
+
 
 // TaskHandle_t task1, task2, task3;
 
@@ -133,7 +137,7 @@ const float dynamicRange = 5.0;    // in bels, not decibels. bel is ten decibels
 #define PRINT_ALL_TIME
 #define PRINT_FASTLED_TIME
 #define PRINT_MAPLEDS_TIME
-// #define PRINT_RAM                   // This uses some resources that block the isr and take a long time
+#define PRINT_RAM                   // This uses some resources that block the isr and take a long time
 // #define PRINT_INDEXES
 // #define TEST_FULL_BUFFER
 #define PRINT_SAMPLE_RATE
@@ -145,7 +149,7 @@ const float dynamicRange = 5.0;    // in bels, not decibels. bel is ten decibels
 int maxCurrent = 15000;
 // int maxBrightness = 32;
 
-#define BUFFER_LENGTH 1700   // 2048 is also just fine. maybe 4096 has too much extra space
+#define BUFFER_LENGTH 3072   // 2048 is also just fine. maybe 4096 has too much extra space
 IRAM_ATTR int32_t bufferRing[BUFFER_LENGTH] = {};
 volatile int writeIndex = 0;   // writeIndex will stay 4 behind readIndex. it can't go past
 volatile int readIndex = 0;    // readIndex can be equal to writeIndex but cannot advance
@@ -161,11 +165,11 @@ const int numLeds = NUM_PANELS_PER_ROW * NUM_PANELS_PER_COLUMN * PANEL_WIDTH * P
 // uint8_t *leds = NULL;
 // CRGB *leds;
 CRGB* leds;
+Coordinates* ledMappingCoordinatesRam;
 
 uint32_t loopMicros;
 uint32_t loopCycles;
 
-#include "I2SClocklessLedDriver.h"
 I2SClocklessLedDriver driver;
 
 char BTname[] = "triumvirate";
@@ -177,7 +181,7 @@ FloatOffset skyOffset;
 
 enum {bluetooth, microphone, artnet} programMode;
 
-static Coordinates IRAM_ATTR mapLed(int hardwareLed)
+__attribute__((always_inline)) IRAM_ATTR static Coordinates mapLed(int hardwareLed)
 {
   Coordinates coordinates;
   // = MOD(FLOOR(A11 / 4), 12)
@@ -196,6 +200,16 @@ static Coordinates IRAM_ATTR mapLed(int hardwareLed)
   }
   // coordinates.y = (((hardwareLed / 16 + 1) % 2) * (hardwareLed % 16) + ((hardwareLed / 16) % 2) * ((16 * 123 - 1 - hardwareLed) % 16) + (hardwareLed / (16 * 7)) * 16 ) % (16 * 7 * 2);
   return coordinates;
+}
+
+__attribute__((always_inline)) IRAM_ATTR static Coordinates directMapLed(int hardwareLed)
+{
+  return (Coordinates)ledMappingCoordinates[hardwareLed];
+}
+
+__attribute__((always_inline)) IRAM_ATTR static Coordinates directMapLedRam(int hardwareLed)
+{
+  return (Coordinates)ledMappingCoordinatesRam[hardwareLed];
 }
 
 float sqrtApprox(float number)
@@ -564,6 +578,22 @@ void setup()
   #ifdef USE_SERIAL
   Serial.begin(115200);
   #endif
+  ledMappingCoordinatesRam = (Coordinates*)calloc(numLeds, sizeof(Coordinates));
+  Serial.println("const int ledMappingCoordinates[] PROGMEM =");
+  Serial.println("{");
+  for (int ledNumber = 0; ledNumber < SCREEN_WIDTH * SCREEN_HEIGHT; ledNumber++)
+  {
+    if (ledNumber % 256 == 0) Serial.println();
+    Coordinates c = mapLed(ledNumber);
+    ledMappingCoordinatesRam[ledNumber].x = c.x;
+    ledMappingCoordinatesRam[ledNumber].y = c.y;
+    Serial.printf("{%d, %d}", c.x, c.y);
+    if (ledNumber != SCREEN_WIDTH * SCREEN_HEIGHT - 1) Serial.print(", ");
+  }
+  Serial.println();
+  Serial.println("};");
+  Serial.println();
+  
   programMode = bluetooth;
   Serial.printf("programMode = %d\n\r", programMode);
   Serial.println("Just booted up");
@@ -586,6 +616,8 @@ void setup()
   leds = (CRGB*)calloc(numLeds, sizeof(CRGB));
   driver.initled((uint8_t*)leds, pins, NUM_PANELS_PER_ROW * NUM_PANELS_PER_COLUMN, PANEL_WIDTH * PANEL_HEIGHT, ORDER_GRB);
   driver.setMapLed(mapLed);
+  // driver.setMapLed(directMapLed);
+  // driver.setMapLed(directMapLedRam);
   // These two lines have to be after driver.initled()
   driver._offsetDisplay.panel_width=SCREEN_WIDTH;
   driver._offsetDisplay.panel_height=SCREEN_HEIGHT;
@@ -802,8 +834,8 @@ void loopBluetooth()
   if (millis() - previousDebugMillis > SECONDS_BETWEEN_DEBUG * 1000)
   {
     previousDebugMillis = millis();
-    Serial.printf("driver._offsetDisplay.panel_width = %d\n", driver._offsetDisplay.panel_width);
-    Serial.printf("driver._offsetDisplay.panel_height = %d\n", driver._offsetDisplay.panel_height);
+    // Serial.printf("driver._offsetDisplay.panel_width = %d\n", driver._offsetDisplay.panel_width);
+    // Serial.printf("driver._offsetDisplay.panel_height = %d\n", driver._offsetDisplay.panel_height);
 
     #ifdef PRINT_FFT_TIME
     Serial.print("FFT took ");
