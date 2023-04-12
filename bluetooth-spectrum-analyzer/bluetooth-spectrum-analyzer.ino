@@ -121,7 +121,7 @@ struct FloatOffset
 #define SECONDS_BETWEEN_DEBUG 600
 
 // #define USE_DOUBLE_BUFFERING
-#define BANDS 112
+#define BANDS 128
 const float dynamicRange = 5.0;    // in bels, not decibels. bel is ten decibels. it's metric. bel is the base unit. long live the metric.
 // #define PRINT_PLOT
 #define DEBUG false
@@ -521,6 +521,9 @@ void powTwoBands(float* _output, float* _bands)
   {
     _bands[i] = 0;
     #if SAMPLES == 4096
+    #if BANDS == 128
+    for (int j = bins_4096_128[i]; j < bins_4096_128[i + 1]; j++)
+    #endif
     #if BANDS == 112
     for (int j = bins_4096_112[i]; j < bins_4096_112[i + 1]; j++)
     #endif
@@ -546,27 +549,26 @@ void logBands(float* _bands, float* _peakBands)
   for (int i = 0; i < BANDS; i++)
   {
     _bands[i] = log10f(_bands[i]);
+    
     #ifdef PRINT_PEAKS
     if (_peakBands[i] < _bands[i]) _peakBands[i] = _bands[i];
     #endif
-    #if BANDS == 7
-    _bands[i] = _bands[i] - substract_7[i] + 6;
+    
+    #if SAMPLES == 4096
+    #if BANDS == 128
+    int delta = bins_4096_128[i + 1] - bins_4096_128[i];
     #endif
-    #if BANDS == 16
-    _bands[i] = _bands[i] - substract_16[i] + 6;
+    #endif 
+    #if SAMPLES == 2048
+    #if BANDS == 128
+    int delta = bins_2048_128[i + 1] - bins_2048_128[i];
     #endif
-    #if BANDS == 32
-    _bands[i] = _bands[i] - substract_32[i] + 6;
-    #endif
-    #if BANDS == 48
-    _bands[i] = _bands[i] - substract_48[i] + 6;
-    #endif
-    #if BANDS == 64
-    _bands[i] = _bands[i] - substract_64[i] + 6;
-    #endif
-    #if BANDS == 112
-    _bands[i] = _bands[i] - substract_112[i] + 6;
-    #endif
+    #endif 
+    
+    if (delta < 1) delta = 1;
+    if (delta > 6) delta = 6;
+    bands[i] = bands[i] - substract_universal[delta - 1] + 6;
+    
   }
 }
 
