@@ -535,7 +535,9 @@ void powTwoBands(float* _output, float* _bands)
     #endif
     #endif 
     #if SAMPLES == 2048
-    for (int j = bins_4096_112[i]/2; j < bins_4096_112[i + 1]/2; j++)
+    #if BANDS == 128
+    for (int j = bins_2048_128[i]; j < bins_2048_128[i + 1]; j++)
+    #endif
     #endif 
     {
      // i=i+1-1;
