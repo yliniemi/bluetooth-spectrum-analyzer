@@ -111,6 +111,8 @@ const int bins_2048_16[17] PROGMEM =
 108, 152, 213, 299, 419, 586, 819};
 
 
+const float substract_universal[6] PROGMEM =
+{ 4.432, 4.668, 4.754, 4.783, 4.789, 4.790 };
 
 const float substract_7[] PROGMEM = {4.45, 4.35, 4.36, 4.35, 4.35, 4.35, 4.39};
 const float substract_16[] PROGMEM = {9.89, 9.85, 9.89, 9.81, 9.81, 9.81, 9.81, 9.81, 9.81, 9.81, 9.81, 9.81, 9.81, 9.81, 9.81, 9.81};
