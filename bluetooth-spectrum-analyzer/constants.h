@@ -1,3 +1,5 @@
+float substract_universal[6]  =
+{ 4.432, 4.668, 4.754, 4.783, 4.789, 4.790 };   // this is here until I make changing KAISER_BETA dynamic. These are the values for KAISER_BETA = 5.0
 
 /*
 const int bins_4096_112[113] PROGMEM =

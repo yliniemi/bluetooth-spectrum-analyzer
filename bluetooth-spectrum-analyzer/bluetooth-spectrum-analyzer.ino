@@ -1,4 +1,4 @@
-
+ 
 
 /*
 TODO
@@ -69,7 +69,10 @@ https://github.com/pschatzmann/ESP32-A2DP
 */
 
 #include "BluetoothA2DPSink.h"
-#include "FFT.h"
+extern "C"
+{
+   #include "fft.h"
+}
 
 struct CRGB {
   union {
@@ -99,6 +102,17 @@ struct FloatOffset
 
 #include "constants.h"
 
+// #define STRESS_RAM
+
+// #define BISCUIT
+
+enum MapMode
+{
+  RAINBOW,
+  TEXTURES
+};
+MapMode mapMode = RAINBOW;
+
 #define TILE_WIDTH 32
 #define TILE_HEIGHT 32
 #define ENABLE_LEDMAP
@@ -108,6 +122,22 @@ struct FloatOffset
 #define NUM_PANELS_PER_COLUMN 2
 #define SCREEN_WIDTH PANEL_WIDTH * NUM_PANELS_PER_ROW
 #define SCREEN_HEIGHT PANEL_HEIGHT * NUM_PANELS_PER_COLUMN
+#define ATX_POWER_ON 13
+#define DEFAULT_SAMPLE_RATE 44100
+#define HIGHEST_FREQUENCY 20000
+#define START_SPECTRUM_AT_THIS_BIN 3
+#define ADD_TO_DELTA 0.5
+
+#ifdef BISCUIT
+#define SIGNAL_STARTS_FROM_THE_BOTTOM
+#define PANEL_WIDTH 16
+#define PANEL_HEIGHT 24
+#define NUM_PANELS_PER_ROW 8
+#define NUM_PANELS_PER_COLUMN 1
+#define SCREEN_WIDTH PANEL_WIDTH * NUM_PANELS_PER_ROW
+#define SCREEN_HEIGHT PANEL_HEIGHT * NUM_PANELS_PER_COLUMN
+#define ATX_POWER_ON 27
+#endif
 
 // TaskHandle_t task1, task2, task3;
 
@@ -116,10 +146,10 @@ struct FloatOffset
 // 512 => 86 fps, 1024 => 43 fps, 2048 => 21 fps
 #define SAMPLES 4096
 // #define WAIT_UNTIL_DRAWING_DONE
-#define SECONDS_BETWEEN_DEBUG 600
+#define SECONDS_BETWEEN_DEBUG 60
 
 // #define USE_DOUBLE_BUFFERING
-#define BANDS 112
+#define BANDS SCREEN_WIDTH
 const float dynamicRange = 5.0;    // in bels, not decibels. bel is ten decibels. it's metric. bel is the base unit. long live the metric.
 // #define PRINT_PLOT
 #define DEBUG false
@@ -133,7 +163,10 @@ const float dynamicRange = 5.0;    // in bels, not decibels. bel is ten decibels
 #define PRINT_ALL_TIME
 #define PRINT_FASTLED_TIME
 #define PRINT_MAPLEDS_TIME
-// #define PRINT_RAM                   // This uses some resources that block the isr and take a long time
+#define PRINT_RAM                   // This uses some resources that block the isr and take a long time
+#ifdef STRESS_RAM
+#define PRINT_RAM
+#endif
 // #define PRINT_INDEXES
 // #define TEST_FULL_BUFFER
 #define PRINT_SAMPLE_RATE
@@ -145,7 +178,7 @@ const float dynamicRange = 5.0;    // in bels, not decibels. bel is ten decibels
 int maxCurrent = 15000;
 // int maxBrightness = 32;
 
-#define BUFFER_LENGTH 1700   // 2048 is also just fine. maybe 4096 has too much extra space
+#define BUFFER_LENGTH 3072   // 2048 is also just fine. maybe 4096 has too much extra space
 IRAM_ATTR int32_t bufferRing[BUFFER_LENGTH] = {};
 volatile int writeIndex = 0;   // writeIndex will stay 4 behind readIndex. it can't go past
 volatile int readIndex = 0;    // readIndex can be equal to writeIndex but cannot advance
@@ -159,12 +192,15 @@ int realRingIndex = 0;
 const int numLeds = NUM_PANELS_PER_ROW * NUM_PANELS_PER_COLUMN * PANEL_WIDTH * PANEL_HEIGHT;
 
 // uint8_t *leds = NULL;
-// CRGB *leds;
-CRGB* leds;
+CRGB *leds;
 
-uint32_t loopMicros;
-uint32_t loopCycles;
+uint32_t loopMicros = 0;
+uint32_t loopCycles = 0;
 
+float deltaRatio = 0;
+
+static uint16_t ledMappingFunction(uint16_t hardwareLed);
+#define __SOFTWARE_MAP
 #include "I2SClocklessLedDriver.h"
 I2SClocklessLedDriver driver;
 
@@ -176,6 +212,48 @@ FloatOffset groundOffset;
 FloatOffset skyOffset;
 
 enum {bluetooth, microphone, artnet} programMode;
+
+__attribute__((always_inline)) IRAM_ATTR static uint16_t ledMappingFunction(uint16_t hardwareLed)
+{
+  int x, y, moduloRow;
+  // = MOD(FLOOR(A11 / 4), 12)
+  x = (hardwareLed / PANEL_HEIGHT) % (PANEL_WIDTH * NUM_PANELS_PER_ROW);
+  // = MOD(MOD(FLOOR(A11 / 4) + 1, 2) * MOD(A11, 4) + MOD(FLOOR(A11 / 4), 2) * MOD(95 - A11, 4) + FLOOR(A11 / 48) * 4, 96)
+  // moduloRow = (hardwareLed / PANEL_HEIGHT) % 2;
+  moduloRow = x % 2;
+  // y = (hardwareLed / PANEL_HEIGHT) % 2;
+  /*
+  #ifdef BISCUIT
+  if (y == 1)
+  #else
+  if (y == 0)
+  #endif
+  {
+    y = (hardwareLed % PANEL_HEIGHT) + (hardwareLed / (PANEL_WIDTH * PANEL_HEIGHT * NUM_PANELS_PER_ROW)) * PANEL_HEIGHT;
+    // y = ((hardwareLed % PANEL_HEIGHT) + (hardwareLed / (PANEL_WIDTH * NUM_PANELS_PER_ROW)) * PANEL_HEIGHT) % (PANEL_WIDTH * NUM_PANELS_PER_ROW * NUM_PANELS_PER_COLUMN);
+  }
+  else
+  {
+                                 y = (hardwareLed % PANEL_HEIGHT) + (hardwareLed / (PANEL_WIDTH * PANEL_HEIGHT * NUM_PANELS_PER_ROW)) * PANEL_HEIGHT;
+    y = ((PANEL_HEIGHT * 12345 - 1 - hardwareLed) % PANEL_HEIGHT) + (hardwareLed / (PANEL_WIDTH * PANEL_HEIGHT * NUM_PANELS_PER_ROW)) * PANEL_HEIGHT;
+    // y = (((PANEL_HEIGHT * 12345 - 1 - hardwareLed) % PANEL_HEIGHT) + (hardwareLed / (PANEL_WIDTH * NUM_PANELS_PER_ROW)) * PANEL_HEIGHT) % (PANEL_WIDTH * NUM_PANELS_PER_ROW * NUM_PANELS_PER_COLUMN);
+  }
+  */
+  #ifdef SIGNAL_STARTS_FROM_THE_BOTTOM
+  // y = (hardwareLed % PANEL_HEIGHT) + (hardwareLed / (PANEL_WIDTH * PANEL_HEIGHT * NUM_PANELS_PER_ROW)) * PANEL_HEIGHT;
+  y = (moduloRow * hardwareLed + (1 - moduloRow) * (PANEL_HEIGHT * 12345 - 1 - hardwareLed)) % PANEL_HEIGHT + (hardwareLed / (PANEL_WIDTH * PANEL_HEIGHT * NUM_PANELS_PER_ROW)) * PANEL_HEIGHT;
+  #else
+  y = ((1 - moduloRow) * hardwareLed + moduloRow * (PANEL_HEIGHT * 12345 - 1 - hardwareLed)) % PANEL_HEIGHT + (hardwareLed / (PANEL_WIDTH * PANEL_HEIGHT * NUM_PANELS_PER_ROW)) * PANEL_HEIGHT;
+  #endif
+  // y = (((hardwareLed / 16 + 1) % 2) * (hardwareLed % 16) + ((hardwareLed / 16) % 2) * ((16 * 123 - 1 - hardwareLed) % 16) + (hardwareLed / (16 * 7)) * 16 ) % (16 * 7 * 2);
+  x = (x + driver._offsetDisplay.offsetx) % driver._offsetDisplay.panel_width;
+  y = (y + driver._offsetDisplay.offsety) % driver._offsetDisplay.panel_height;
+  // #ifdef BISCUIT
+  // return x + y * driver._offsetDisplay.panel_width - 1;
+  // #else
+  return x + y * driver._offsetDisplay.panel_width;
+  // #endif
+}
 
 float sqrtApprox(float number)
 {
@@ -226,7 +304,7 @@ void mapLeds()
 }
 */
 
-void mapLeds(float* bands)
+void mapLeds_rainbow(float* bands)
 {
   for (int x = 0; x < BANDS; x++)
   {
@@ -245,7 +323,7 @@ void mapLeds(float* bands)
   }
 }
 
-void mapLeds_textures(int x, FloatOffset groundOffset, FloatOffset skyOffset, float* bands)
+__attribute__((always_inline)) void mapLeds_textures(int x, FloatOffset groundOffset, FloatOffset skyOffset, float* bands)
 {
     // CRGB color = redToBlue(((float)x / (BANDS - 1)) * sqrtApprox((float)x / (BANDS - 1)));
     for (int y = 0; y < SCREEN_HEIGHT; y++)
@@ -291,7 +369,7 @@ void drawCharacter(const CRGB* character, float startingColumn, float offSet, fl
   {
     if (x >= 0 && x < SCREEN_WIDTH)
     {
-      for (int y = SCREEN_HEIGHT - frameHeight; y < SCREEN_HEIGHT; y++)
+      for (int y = max(SCREEN_HEIGHT - frameHeight, 0); y < SCREEN_HEIGHT; y++)
       {
         int characterPixel = x - (int)(startingColumn + 100) + 100 + frame * frameWidth + (y - SCREEN_HEIGHT + frameHeight) * (numberOfFrames * frameWidth);
         // if (character[characterPixel].r != 0xFE && character[characterPixel].g != 0xFD && character[characterPixel].b != 0xFC)
@@ -330,9 +408,8 @@ void mapLeds()     // upside down
 }
 */
 
-void doWindowing(float* inputReal)
+void substractAverage(float* inputReal)
 {
-  // first we calculate the average of the signal so we can remove any dc offset
   float average = 0;
   for (int i = 0; i < SAMPLES; i++)
   {
@@ -341,7 +418,15 @@ void doWindowing(float* inputReal)
   average /= SAMPLES;
   for (int i = 0; i < SAMPLES; i++)
   {
-    inputReal[i] = (inputReal[i] - average) * windowingArray[i];
+    inputReal[i] = inputReal[i] - average;
+  }
+}
+
+void doWindowing(float* inputReal)
+{
+  for (int i = 0; i < SAMPLES; i++)
+  {
+    inputReal[i] = inputReal[i] * windowingArray[i];
   }
 }
 
@@ -374,7 +459,7 @@ void startAudio()
 {
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t) (I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = 44100, // updated automatically by A2DP
+    .sample_rate = DEFAULT_SAMPLE_RATE, // updated automatically by A2DP
     .bits_per_sample = (i2s_bits_per_sample_t)16,
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = (i2s_comm_format_t) (I2S_COMM_FORMAT_STAND_I2S),
@@ -388,11 +473,19 @@ void startAudio()
   a2dp_sink.set_i2s_port(I2S_NUM_1);
   a2dp_sink.set_stream_reader(audio_data_callback);
   
+  #ifdef BISCUIT
+  i2s_pin_config_t my_pin_config = {
+      .bck_io_num = 14,
+      .ws_io_num = 13,
+      .data_out_num = 12,
+      .data_in_num = I2S_PIN_NO_CHANGE };
+  #else
   i2s_pin_config_t my_pin_config = {
       .bck_io_num = 4,
       .ws_io_num = 15,
       .data_out_num = 16,
       .data_in_num = I2S_PIN_NO_CHANGE };
+  #endif
   a2dp_sink.set_pin_config(my_pin_config);
   // a2dp_sink.set_auto_reconnect(false);    // maybe this helps with my compatibility problem
   
@@ -452,6 +545,22 @@ void powerOfTwo(float* output)
   }
 }
 
+void zeroSmallBins(float* output)
+{
+  float biggest = 0;
+  for (int i = 0; i < SAMPLES / 2; i++)
+  {
+    if (biggest < output[i]) biggest = output[i];
+  }
+  for (int i = 0; i < SAMPLES / 2; i++)
+  {
+    // we get rid of the unwanted frequency side lobes this way. kaiser 2 is quite eficient and we shouldn't see more than -60 dB on the side lobes
+    // at the same time we make sure that we don't take logarithm out of zero. that would be -infinite
+    output[i] = std::max(output[i] - biggest * 0.0000003, 0.0000000001);
+    }
+}
+
+/*
 void powTwoBands(float* output, float* bands)
 {
   for (int i = 0; i < BANDS; i++)
@@ -470,12 +579,14 @@ void powTwoBands(float* output, float* bands)
     #endif 
     #if SAMPLES == 2048
     for (int j = bins_2048_64[i]; j < bins_2048_64[i + 1]; j++)
-    #endif 
+    #endif
+    
     {
       bands[i] += output[j];
     }
   }
 }
+*/
 
 void logBands(float* bands, float* peakBands)
 {
@@ -523,18 +634,71 @@ void normalizeBands(float* bands)
   }
 }
 
-void zeroSmallBins(float* output)
+  /* These will be combined to one function
+  powTwoBands(output, bands);
+  logBands(bands, peakBands);
+  normalizeBands(bands);
+  */
+void powerBinsToBands(float* output, float* bands)
 {
-  float biggest = 0;
-  for (int i = 0; i < SAMPLES / 2; i++)
+  int32_t startingPoint = START_SPECTRUM_AT_THIS_BIN;
+  for (int32_t i = 0; i < BANDS; i++)
   {
-    if (biggest < output[i]) biggest = output[i];
+    bands[i] = 0;
+    int32_t delta = (startingPoint * deltaRatio) + ADD_TO_DELTA;
+    if (delta <= 0) delta = 1;
+    for (int32_t j = 0; j < delta; j++)
+    {
+      bands[i] += output[startingPoint + j];
+    }
+    startingPoint += delta;
+    bands[i] = log10f(bands[i]);
+    #ifdef PRINT_PEAKS
+    if (peakBands[i] < bands[i]) peakBands[i] = bands[i];
+    #endif
+    // if (delta < 1) delta = 1;
+    if (delta > 6) delta = 6;
+    bands[i] -= substract_universal[delta - 1];
   }
-  for (int i = 0; i < SAMPLES / 2; i++)
+  static float bandCeiling = -1000000;
+  #ifdef PRINT_CEILING
+  Serial.println(String("bandCeiling = ") + bandCeiling);
+  #endif
+  bandCeiling -= 0.00002;          // now it takes 300 seconds to come 10 dB down
+  for (int i = 0; i < BANDS; i++)
   {
-    // we get rid of the unwanted frequency side lobes this way. kaiser 2 is quite eficient and we shouldn't see more than -60 dB on the side lobes
-    // at the same time we make sure that we don't take logarithm out of zero. that would be -infinite
-    output[i] = std::max(output[i] - biggest * 0.0000003, 0.0000000001);
+    if (bands[i] > bandCeiling) bandCeiling = bands[i];
+  }
+  for (int i = 0; i < BANDS; i++)
+  {
+    bands[i] = (bands[i] - bandCeiling + dynamicRange) / dynamicRange;
+  }
+}
+
+float __attribute__ ((noinline)) checkDeltaRatio(float ratio, float startingPoint, int32_t rounds)
+{
+    for (int32_t i = 0; i < rounds; i++)
+    {
+        float delta = floorf((startingPoint * ratio) + ADD_TO_DELTA);
+        if (delta <= 0) delta = 1;
+        startingPoint += delta;
+    }
+    return startingPoint;
+}
+
+float __attribute__ ((noinline)) findDeltaRatio(int32_t maxDepth, float low, float high, float lowestValid, float startingPoint, int32_t endGoal, int32_t rounds)
+{
+    float middle = (low + high) * 0.5;
+    float result = checkDeltaRatio(middle, startingPoint, rounds);
+    // Serial.printf("%.17f : %f\n", middle, result);
+    if (maxDepth <= 0) return lowestValid;    
+    if (result > endGoal)
+    {
+        return findDeltaRatio(maxDepth - 1, low, middle, lowestValid, startingPoint, endGoal, rounds);
+    }
+    else
+    {
+        return findDeltaRatio(maxDepth - 1, middle, high, middle, startingPoint, endGoal, rounds);
     }
 }
 
@@ -553,17 +717,29 @@ void setup()
   Serial.print("heap_caps_get_largest_free_block(MALLOC_CAP_32BIT) = ");
   Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_32BIT));
   delay(100);
-  
+  int32_t lastBin = min(SAMPLES / 2 - 1, HIGHEST_FREQUENCY * SAMPLES / DEFAULT_SAMPLE_RATE);
+  deltaRatio = findDeltaRatio(25, 0, 0.2, 0, START_SPECTRUM_AT_THIS_BIN, lastBin, BANDS);
+  Serial.printf("deltaRatio = %f\n", deltaRatio);
   Serial.printf("numLeds = %d\n", numLeds);
   Serial.printf("SCREEN_WIDTH = %d\n", SCREEN_WIDTH);
   Serial.printf("SCREEN_HEIGHT = %d\n", SCREEN_HEIGHT);
-    
+  
+  #ifdef BISCUIT
+  int pins[] = {15, 4, 16, 17, 5, 18, 19, 21};              // esp32 dev kit v1
+  #else
   int pins[] = {32, 33, 25, 26, 27, 14, 12, 23, 22, 21, 19, 18, 5, 17};              // esp32 dev kit v1
+  #endif
   #ifndef WAIT_UNTIL_DRAWING_DONE
   driver.__displayMode = NO_WAIT;
   #endif
+  
+  #ifdef STRESS_RAM
+  leds = (CRGB*)calloc(numLeds * 2, sizeof(CRGB));      // testing if I have enough ram for a 112 x 64 screen
+  driver.initled((uint8_t*)leds, pins, NUM_PANELS_PER_ROW * NUM_PANELS_PER_COLUMN, PANEL_WIDTH * PANEL_HEIGHT * 2, ORDER_GRB);    // simulating screen twice as big and half as fast
+  #else
   leds = (CRGB*)calloc(numLeds, sizeof(CRGB));
   driver.initled((uint8_t*)leds, pins, NUM_PANELS_PER_ROW * NUM_PANELS_PER_COLUMN, PANEL_WIDTH * PANEL_HEIGHT, ORDER_GRB);
+  #endif
   // These two lines have to be after driver.initled()
   driver._offsetDisplay.panel_width=SCREEN_WIDTH;
   driver._offsetDisplay.panel_height=SCREEN_HEIGHT;
@@ -580,6 +756,8 @@ void setup()
   skyOffset.x = 0;
   skyOffset.y = 0;
   
+  // driver.setMapLed(mapLedsOnPanel);
+  
   startAudio();
   Serial.print("ESP.getFreeHeap() = ");
   Serial.println(ESP.getFreeHeap());
@@ -589,11 +767,13 @@ void setup()
   Serial.println(heap_caps_get_largest_free_block(MALLOC_CAP_32BIT));
   delay(100);
   
-  pinMode(13, OUTPUT);
-  digitalWrite(13, LOW);
+  pinMode(ATX_POWER_ON, OUTPUT);
+  digitalWrite(ATX_POWER_ON, LOW);
   // gpio_set_direction((gpio_num_t)13, GPIO_MODE_OUTPUT);
   // gpio_set_level((gpio_num_t)13, 0);
   
+  Serial.printf("ledMappingFunction(0) = %d\n\r", ledMappingFunction(0));
+  Serial.printf("ledMappingFunction(1790) = %d\n\r", ledMappingFunction(1790));
 }
 
 void loopBluetooth()
@@ -609,6 +789,7 @@ void loopBluetooth()
   static float* peakBands;
   #endif
   
+  bool charactersOn = false;
   static unsigned int beebBoob = 178;
   static uint32_t previousMicros = 0;
   static uint32_t previousCycles = 0;
@@ -647,14 +828,19 @@ void loopBluetooth()
   uint32_t fftCycles = xthal_get_ccount();
   #endif
   
+  // substractAverage(inputReal);
   doWindowing(inputReal);
   fft_execute(fftReal);
   powerOfTwo(output);   // if we end up doing log() of the output anyways there is no need to do costly sqrt() because it's the same as dividing log() by 2
   // sqrtBins();     // we don't actually need this since we are dealing with the power of the signal and not the amplitude
   zeroSmallBins(output);  // we do this because there are plenty of of reflections in the surrounding bins
+
+  /* These will be combined to one function
   powTwoBands(output, bands);
   logBands(bands, peakBands);
   normalizeBands(bands);
+  */
+  powerBinsToBands(output, bands);
   
   groundOffset.x += 0.03;
   groundOffset.y += 0.5;
@@ -669,8 +855,9 @@ void loopBluetooth()
   fftMicros = micros() - fftMicros;
   fftCycles = xthal_get_ccount() - fftCycles;
   #endif
+  
   #ifndef WAIT_UNTIL_DRAWING_DONE
-  driver.waitUntilDone();
+  while (driver.isDisplaying == true) vTaskDelay(1);
   #endif
   
   #ifdef PRINT_RAM
@@ -692,66 +879,78 @@ void loopBluetooth()
   // mapLeds();
   // mapLeds_mario();
   // driver.ledToDisplay will be needed next
-  for (int x = 0; x < SCREEN_WIDTH; x++)
+  switch (mapMode)
   {
-    mapLeds_textures(x, groundOffset, skyOffset, bands);
+    case TEXTURES:
+    for (int x = 0; x < BANDS; x++)
+    {
+      mapLeds_textures(x, groundOffset, skyOffset, bands);
+    }
+    break;
+    
+    case RAINBOW:
+    mapLeds_rainbow(bands);
+    break;
   }
   
-  // drawCharacter(CRGB* character, float startingColumn, float offset, int columnsPerFrame, int numberOfFrames, int frameWidth, int frameHeight)
-  static uint32_t characterNumber = 0;
-  static int frameWidth = 32;
-  static int frameHeight = 32;
-  static int numberOfFrames = 8;
-  static const CRGB* currentCharacter = (const CRGB*)tuxes_walking;
-  static float columnsPerFrame = 1.5;
-  static float offset = 100.4 + ((double)esp_random() / (double)4194304);
-  static float startingColumn = 0 - frameWidth;
-  // [frameHeight * 2 * (characterNumber % 11) * 3 * frameWidth * numberOfFrames]
-  drawCharacter(currentCharacter, startingColumn, offset, columnsPerFrame, numberOfFrames, frameHeight, frameWidth);
-  startingColumn += 0.2;
-  if (startingColumn > SCREEN_WIDTH + frameWidth + 4)
+  if (charactersOn == true)
   {
-    characterNumber = (characterNumber + 1) % 24;
+    // drawCharacter(CRGB* character, float startingColumn, float offset, int columnsPerFrame, int numberOfFrames, int frameWidth, int frameHeight)
+    static uint32_t characterNumber = 0;
+    static int frameWidth = 32;
+    static int frameHeight = 32;
+    static int numberOfFrames = 8;
+    static const CRGB* currentCharacter = (const CRGB*)tuxes_walking;
+    static float columnsPerFrame = 1.5;
+    static float offset = 100.4 + ((double)esp_random() / (double)4194304);
+    static float startingColumn = 0 - frameWidth;
+    // [frameHeight * 2 * (characterNumber % 11) * 3 * frameWidth * numberOfFrames]
+    drawCharacter(currentCharacter, startingColumn, offset, columnsPerFrame, numberOfFrames, frameHeight, frameWidth);
+    startingColumn += 0.2;
+    if (startingColumn > SCREEN_WIDTH + frameWidth + 4)
     {
-      currentCharacter = (const CRGB*)tuxes_walking + characterNumber * frameHeight * frameWidth * numberOfFrames;
-      frameWidth = 32;
-      frameHeight = 32;
-      numberOfFrames = 8;
+      characterNumber = (characterNumber + 1) % 24;
+      {
+        currentCharacter = (const CRGB*)tuxes_walking + characterNumber * frameHeight * frameWidth * numberOfFrames;
+        frameWidth = 32;
+        frameHeight = 32;
+        numberOfFrames = 8;
+      }
+      // offset = 100.4 + (float)esp_random() / 1000000.4;
+      offset = 100.4 + ((double)esp_random() / (double)4194304);
+      if ((characterNumber % 2) == 0)
+      {
+        columnsPerFrame = 1.5;
+      }
+      else
+      {
+        columnsPerFrame = 2;
+      }
+      if (characterNumber == 22)
+      {
+        currentCharacter = (const CRGB*)guido_walking;
+        frameWidth = 32;
+        frameHeight = 32;
+        numberOfFrames = 8;
+        columnsPerFrame = 2; 
+      }
+      if (characterNumber == 23)
+      {
+        currentCharacter = (const CRGB*)squirrel_walking;
+        frameWidth = 20;
+        frameHeight = 20;
+        numberOfFrames = 6;
+        columnsPerFrame = 2;
+      }
+      startingColumn = 0 - frameWidth - 4;
+      // Serial.printf("Color of the first pixel is %u\n\r", (*(uint32_t*)&(currentCharacter[0])));
+      // it should be 16711164;
+      // it's actually 4277992958 because the cpu is little endian
+      // that means that the last byte of the number is stored in the beginning
+      // all the bytes in a number are in reverse order
+      // back in the day when the bit width of the memory lane was less than the bit width of the cpu
+      // it allowed the cpu to start the calculations one clock cycle before it got the whole number
     }
-    // offset = 100.4 + (float)esp_random() / 1000000.4;
-    offset = 100.4 + ((double)esp_random() / (double)4194304);
-    if ((characterNumber % 2) == 0)
-    {
-      columnsPerFrame = 1.5;
-    }
-    else
-    {
-      columnsPerFrame = 2;
-    }
-    if (characterNumber == 22)
-    {
-      currentCharacter = (const CRGB*)guido_walking;
-      frameWidth = 32;
-      frameHeight = 32;
-      numberOfFrames = 8;
-      columnsPerFrame = 2; 
-    }
-    if (characterNumber == 23)
-    {
-      currentCharacter = (const CRGB*)squirrel_walking;
-      frameWidth = 20;
-      frameHeight = 20;
-      numberOfFrames = 6;
-      columnsPerFrame = 2;
-    }
-    startingColumn = 0 - frameWidth - 4;
-    // Serial.printf("Color of the first pixel is %u\n\r", (*(uint32_t*)&(currentCharacter[0])));
-    // it should be 16711164;
-    // it's actually 4277992958 because the cpu is little endian
-    // that means that the last byte of the number is stored in the beginning
-    // all the bytes in a number are in reverse order
-    // back in the day when the bit width of the memory lane was less than the bit width of the cpu
-    // it allowed the cpu to start the calculations one clock cycle before it got the whole number
   }
   mapLedsMicros = micros() - mapLedsMicros;
   mapLedsCycles = xthal_get_ccount() - mapLedsCycles;
@@ -764,7 +963,7 @@ void loopBluetooth()
   // leds[8 * SCREEN_WIDTH + 51].r = 255;
   // leds[8 * SCREEN_WIDTH + 51].g = 255;
   // leds[8 * SCREEN_WIDTH + 51].b = 255;
-  driver.showPixels();
+  driver.showPixels(NO_WAIT);
 
   showPixelsMicros = micros() - showPixelsMicros;
   showPixelsCycles = xthal_get_ccount() - showPixelsCycles;
